@@ -135,8 +135,8 @@ Small and focused. Explain what you changed and what you ran to verify it —
 actual output, not an assertion that it works. If you touched the security
 boundary, say which test covers the change.
 
-Please do not include generated artifacts: `~/.agentbox` state, built images, or
-`research/build/vendor/`.
+Please do not include generated artifacts: `~/.agentbox` state, built images,
+qcow2 overlays, seed ISOs or console logs. `.gitignore` covers the usual ones.
 
 ## Code of conduct
 
