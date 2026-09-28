@@ -133,15 +133,25 @@ net_apply() {
     # (ssh, dev servers, databases) stay invisible from inside a box.
     echo "  chain input {"
     echo "    type filter hook input priority 0; policy accept;"
-    echo "    iifname \"$AGENTBOX_BRIDGE\" meta l4proto { tcp, udp } th dport 53 accept"
-    echo "    iifname \"$AGENTBOX_BRIDGE\" icmp type echo-request accept"
+    # Return traffic first. The host opens ssh TO the guest, so the guest's
+    # replies arrive here as an established flow; a per-box drop placed above
+    # this would blackhole them and the box would never become reachable.
+    # Conntrack state cannot be forged by the guest for a flow that does not
+    # exist, so this does not weaken the per-box policy below.
     echo "    iifname \"$AGENTBOX_BRIDGE\" ct state established,related accept"
+
+    # Per-box rules then precede the generic accepts. nftables is first-match,
+    # so a blanket "dport 53 accept" above a proxy box's drop would hand that
+    # box a DNS channel -- the exfiltration path proxy mode exists to remove.
+    # A new DNS query is ct state NEW, so it falls through to the drop.
     for n in $(list_boxes); do
       # shellcheck disable=SC1090
       ( source "$(box_conf "$n")"
         [[ $BOX_NET == bridge ]] || exit 0
         egress_input_rules "$BOX_EGRESS" "$BOX_IP" "$BOX_INDEX" )
     done
+    echo "    iifname \"$AGENTBOX_BRIDGE\" meta l4proto { tcp, udp } th dport 53 accept"
+    echo "    iifname \"$AGENTBOX_BRIDGE\" icmp type echo-request accept"
     echo "    iifname \"$AGENTBOX_BRIDGE\" drop"
     echo "  }"
 

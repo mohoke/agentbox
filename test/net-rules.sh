@@ -111,8 +111,8 @@ deny "sealed box has no accept rule"  'ip saddr 10\.77\.0\.4 .*accept'
 deny "open/none boxes get no set"     'set allow_(2|4)'
 
 # Ordering matters: a drop placed before its accept would silently seal the box.
-a=$(grep -n 'ip saddr 10\.77\.0\.3 ip daddr @allow_3 accept' <<<"$RULES" | cut -d: -f1)
-d=$(grep -n 'ip saddr 10\.77\.0\.3 drop' <<<"$RULES" | cut -d: -f1)
+a=$(grep -n 'ip saddr 10\.77\.0\.3 ip daddr @allow_3 accept' <<<"$RULES" | cut -d: -f1 || true)
+d=$(grep -n 'ip saddr 10\.77\.0\.3 drop' <<<"$RULES" | cut -d: -f1 || true)
 if [[ -n $a && -n $d && $a -lt $d ]]; then
   printf '  \033[32mok\033[0m   allow rule precedes its drop (line %s < %s)\n' "$a" "$d"; pass=$((pass+1))
 else
@@ -131,6 +131,37 @@ else
   printf '  \033[32mok\033[0m   proxy box never forwards out\n'; pass=$((pass+1))
 fi
 want "proxy box: may reach the proxy"   'ip saddr 10\.77\.0\.5 tcp dport 8123 accept'
+
+# Regression: nftables is first-match, so the proxy box's drop has to come
+# BEFORE the blanket DNS accept, or proxy mode silently keeps a DNS channel.
+IN=$(sed -n '/chain input/,/^  }/p' <<<"$RULES")
+p_drop=$(grep -n 'ip saddr 10\.77\.0\.5 drop' <<<"$IN" | head -1 | cut -d: -f1 || true)
+dns_ln=$(grep -n 'th dport 53 accept'          <<<"$IN" | head -1 | cut -d: -f1 || true)
+if [[ -n $p_drop && -n $dns_ln && $p_drop -lt $dns_ln ]]; then
+  printf '  \033[32mok\033[0m   proxy box denied DNS (drop at %s precedes accept at %s)\n' "$p_drop" "$dns_ln"
+  pass=$((pass+1))
+else
+  printf '  \033[31mFAIL\033[0m proxy box can still reach DNS (drop=%s, dns accept=%s)\n' "$p_drop" "$dns_ln"
+  fail=$((fail+1))
+fi
+# Return traffic must be accepted before any per-box drop, or the host can
+# never ssh in to a proxy-mode box: its replies arrive as an established flow.
+ct_ln=$(grep -n 'ct state established,related accept' <<<"$IN" | head -1 | cut -d: -f1 || true)
+if [[ -n $ct_ln && -n $p_drop && $ct_ln -lt $p_drop ]]; then
+  printf '  \033[32mok\033[0m   return traffic accepted before per-box drops (ssh works)\n'
+  pass=$((pass+1))
+else
+  printf '  \033[31mFAIL\033[0m per-box drop precedes ct-established: ssh to the box would hang\n'
+  fail=$((fail+1))
+fi
+
+# Non-proxy boxes must keep their resolver.
+o_drop=$(grep -n 'ip saddr 10\.77\.0\.2 drop' <<<"$IN" | head -1 | cut -d: -f1 || true)
+if [[ -z $o_drop ]]; then
+  printf '  \033[32mok\033[0m   non-proxy box keeps DNS access\n'; pass=$((pass+1))
+else
+  printf '  \033[31mFAIL\033[0m non-proxy box lost DNS access\n'; fail=$((fail+1))
+fi
 want "proxy box: nothing else to host"  'ip saddr 10\.77\.0\.5 drop'
 
 # --- vpn kill switch ------------------------------------------------------
@@ -147,8 +178,8 @@ else
   printf '  \033[32mok\033[0m   vpn box has no unqualified accept\n'; pass=$((pass+1))
 fi
 
-v_a=$(grep -n 'ip saddr 10\.77\.0\.6 oifname "wg-agent" accept' <<<"$RULES" | cut -d: -f1)
-v_d=$(grep -n 'ip saddr 10\.77\.0\.6 drop' <<<"$RULES" | cut -d: -f1)
+v_a=$(grep -n 'ip saddr 10\.77\.0\.6 oifname "wg-agent" accept' <<<"$RULES" | cut -d: -f1 || true)
+v_d=$(grep -n 'ip saddr 10\.77\.0\.6 drop' <<<"$RULES" | cut -d: -f1 || true)
 if [[ -n $v_a && -n $v_d && $v_a -lt $v_d ]]; then
   printf '  \033[32mok\033[0m   vpn accept precedes its kill-switch drop\n'; pass=$((pass+1))
 else

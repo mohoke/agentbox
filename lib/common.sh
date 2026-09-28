@@ -119,6 +119,33 @@ wait_for_ssh() {
     fi
     sleep 2; t=$((t+2))
   done
+
+  # A bare timeout tells the user nothing. Say which layer failed.
+  warn "no ssh from '$BOX_NAME' after ${timeout}s -- diagnosing"
+  if ! box_running "$bd"; then
+    dim "    qemu is not running; the guest died. Last console output:"
+    tail -n 15 "$bd/run/console.log" 2>/dev/null | sed 's/^/      /' >&2
+    return 1
+  fi
+  dim "    qemu is alive (pid $(box_pid "$bd"))"
+  # shellcheck disable=SC1090
+  ( source "$(box_conf "$BOX_NAME")"
+    if [[ $BOX_NET == bridge ]]; then
+      if ping -c1 -W2 "$BOX_IP" >/dev/null 2>&1; then
+        dim "    $BOX_IP answers ping, so the guest booted and configured its network"
+        dim "    -> sshd is not up, or the nftables policy is dropping the reply"
+      else
+        dim "    $BOX_IP does not answer ping"
+        dim "    -> the guest has not applied its static address (cloud-init), or the"
+        dim "       tap is not attached to $AGENTBOX_BRIDGE"
+        ip -br link show "ag$BOX_INDEX" 2>/dev/null | sed 's/^/      tap: /' >&2 \
+          || dim "      tap ag$BOX_INDEX does not exist"
+      fi
+    else
+      dim "    slirp mode; check that 127.0.0.1:$BOX_SSH_PORT is listening"
+    fi )
+  dim "    full console: agentbox logs $BOX_NAME"
+  tail -n 8 "$bd/run/console.log" 2>/dev/null | sed 's/^/      /' >&2
   return 1
 }
 
