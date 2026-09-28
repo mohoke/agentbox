@@ -49,10 +49,42 @@ IP_B=$(sed -n 's/^BOX_IP=//p' "$HOME/.agentbox/boxes/$B/box.conf")
 HOST_LAN=$(ip -j route show default | jq -r '.[0].prefsrc // empty')
 
 echo "# egress policy: box A is proxy-filtered"
-if inbox "$A" 'curl -sS --max-time 15 -o /dev/null https://api.anthropic.com'; then
-  ok_ "allowlisted host reachable through the proxy"
+# Verify the host can reach the target first. A slow or blocked upstream is an
+# environment condition, not a policy failure, and conflating the two makes the
+# suite report a broken proxy whenever the network is having a bad day.
+TARGET=api.anthropic.com
+if ! curl -sS --max-time 25 -o /dev/null "https://$TARGET" 2>/dev/null; then
+  skip_ "allowlisted host reachable through the proxy" \
+        "(the host itself cannot reach $TARGET)"
 else
-  bad_ "allowlisted host unreachable" "(check agentbox egress-log $A)"
+  # Generous timeout: this traverses the proxy on top of whatever the upstream
+  # already costs, and the host measurement above is the floor, not the budget.
+  if inbox "$A" "curl -sS --max-time 45 -o /dev/null https://$TARGET"; then
+    ok_ "allowlisted host reachable through the proxy"
+  else
+    # The audit log says which half failed: a `deny` is the policy refusing,
+    # anything else is the upstream.
+    verdict=$(python3 - "$HOME/.agentbox/boxes/$A/run/egress.jsonl" "$TARGET" <<'PYV'
+import json, sys
+host, out = sys.argv[2].lower(), "none"
+try:
+    for line in open(sys.argv[1], encoding="utf-8"):
+        try: r = json.loads(line)
+        except json.JSONDecodeError: continue
+        if r.get("host", "").lower() == host:
+            out = r.get("event", "none")
+except OSError:
+    pass
+print(out)
+PYV
+)
+    case $verdict in
+      deny) bad_ "allowlisted host was DENIED by the proxy" "policy is wrong" ;;
+      error) skip_ "allowlisted host reachable through the proxy" \
+                   "(proxy allowed it; upstream connect failed)" ;;
+      *)    bad_ "allowlisted host unreachable" "(verdict=$verdict; agentbox egress-log $A)" ;;
+    esac
+  fi
 fi
 if inbox "$A" 'curl -sS --max-time 12 -o /dev/null https://example.com'; then
   bad_ "NON-allowlisted host was reachable" "policy is not holding"
