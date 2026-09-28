@@ -24,6 +24,19 @@ net_is_up() { ip link show "$AGENTBOX_BRIDGE" >/dev/null 2>&1; }
 
 require_net_up() {
   net_is_up || die "bridge $AGENTBOX_BRIDGE is down -- run: agentbox net up"
+  # VPN clients and container runtimes reset ip_forward behind our back, which
+  # silently kills egress for every bridge box. Re-assert it rather than leaving
+  # the user to discover it as "the network just stopped working".
+  if [[ $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) != 1 ]]; then
+    if sudo_ok; then
+      sudo sysctl -qw net.ipv4.ip_forward=1
+      warn "ip_forward had been reset to 0 (a VPN client usually does this); restored"
+    else
+      warn "ip_forward is 0, so bridge boxes cannot reach the internet"
+      dim  "    something reset it -- a VPN client is the usual cause. Restore with:"
+      dim  "        sudo sysctl -w net.ipv4.ip_forward=1"
+    fi
+  fi
 }
 
 # ---------------------------------------------------------------- bring up ---
@@ -150,7 +163,13 @@ net_apply() {
         [[ $BOX_NET == bridge ]] || exit 0
         egress_input_rules "$BOX_EGRESS" "$BOX_IP" "$BOX_INDEX" )
     done
-    echo "    iifname \"$AGENTBOX_BRIDGE\" meta l4proto { tcp, udp } th dport 53 accept"
+    # Two explicit rules rather than `meta l4proto { tcp, udp } th dport 53`.
+    # That combined form loads without complaint but does not match here, so
+    # DNS fell through to the chain's drop and no bridge box could resolve --
+    # while ICMP, matched by the next rule, still worked and made the network
+    # look half-alive. Protocol-qualified matches are unambiguous.
+    echo "    iifname \"$AGENTBOX_BRIDGE\" udp dport 53 accept"
+    echo "    iifname \"$AGENTBOX_BRIDGE\" tcp dport 53 accept"
     echo "    iifname \"$AGENTBOX_BRIDGE\" icmp type echo-request accept"
     echo "    iifname \"$AGENTBOX_BRIDGE\" drop"
     echo "  }"

@@ -17,6 +17,7 @@ apt-get -y install --no-install-recommends \
   python3 python3-venv python3-pip python3-dev pipx \
   postgresql postgresql-contrib libpq-dev \
   sqlite3 jq ripgrep fd-find tmux htop less unzip zip rsync file \
+  bind9-dnsutils iproute2 \
   openssh-server ncdu bash-completion man-db locales tzdata
 
 # Ubuntu ships fd as fdfind to avoid a name clash; agents expect `fd`.

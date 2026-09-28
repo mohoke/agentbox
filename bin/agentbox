@@ -637,6 +637,48 @@ cmd_allow() {
   net_is_up && net_apply || true
 }
 
+# ============================================================== netdiag =====
+cmd_netdiag() {
+  local name="${1-}"
+  [[ -n $name ]] || die "usage: agentbox netdiag <name>"
+  load_box "$name"
+  box_running "$BOX_DIR" || die "box '$name' is not running -- agentbox up $name"
+
+  printf '\nhost side\n' >&2
+  printf '  %-34s %s\n' "box" "$name ($BOX_NET, egress=$BOX_EGRESS${BOX_UPLINK:+, uplink=$BOX_UPLINK})" >&2
+  if [[ $BOX_NET == bridge ]]; then
+    printf '  %-34s %s\n' "bridge $AGENTBOX_BRIDGE" \
+      "$(ip -br addr show "$AGENTBOX_BRIDGE" 2>/dev/null | awk '{print $2, $3}' || echo 'DOWN -- run: agentbox net up')" >&2
+    printf '  %-34s %s\n' "tap ag$BOX_INDEX" \
+      "$(ip -br link show "ag$BOX_INDEX" 2>/dev/null | awk '{print $2}' || echo 'MISSING')" >&2
+    if pgrep -f "listen-address=$AGENTBOX_HOST_IP" >/dev/null 2>&1; then
+      printf '  %-34s %s\n' "dnsmasq on $AGENTBOX_HOST_IP" "running" >&2
+    else
+      printf '  %-34s %s\n' "dnsmasq on $AGENTBOX_HOST_IP" "NOT RUNNING -- run: agentbox net up" >&2
+    fi
+    if [[ $BOX_EGRESS == proxy ]]; then
+      local pp; pp=$(box_proxy_port "$BOX_INDEX")
+      if [[ -s $BOX_DIR/run/proxy.pid ]] && kill -0 "$(<"$BOX_DIR/run/proxy.pid")" 2>/dev/null; then
+        printf '  %-34s %s\n' "egress proxy :$pp" "running ($(grep -cvE '^\s*(#|$)' "$BOX_DIR/allow.txt") hosts allowed)" >&2
+      else
+        printf '  %-34s %s\n' "egress proxy :$pp" "NOT RUNNING" >&2
+      fi
+    fi
+  else
+    printf '  %-34s %s\n' "slirp ssh forward" "127.0.0.1:$BOX_SSH_PORT" >&2
+  fi
+  printf '  %-34s %s\n' "nftables policy" \
+    "$(sudo -n nft list table inet agentbox >/dev/null 2>&1 && echo loaded || echo 'cannot read (needs sudo)')" >&2
+
+  printf '\nguest side\n' >&2
+  # Piped over ssh rather than quoted inline: nesting a diagnostic script
+  # through ssh argument quoting is a reliable way to corrupt it.
+  # shellcheck disable=SC2086
+  ssh -F "$SSH_CONFIG" $(ssh_opts) -o BatchMode=yes "$name" \
+      "bash -s -- ${AGENTBOX_DNS}" < "$AGENTBOX_ROOT/libexec/netdiag-guest.sh" \
+    || warn "could not run the guest diagnostic"
+}
+
 # =========================================================== egress-log =====
 cmd_egress_log() {
   local name=${1:?usage: agentbox egress-log <name> [n]}
@@ -723,6 +765,8 @@ agentbox -- one disposable KVM microVM per project, for coding agents.
   allow <name> --bundle NAME     add a whole ecosystem (python, node, rust, go...)
   allow --list                   show the available egress bundles
   egress-log <name> [n]          what the box tried to reach, and what was denied
+  netdiag <name>                 why the network is not working: address, route,
+                                 resolver and proxy, host side and guest side
   net up|down|status|refresh     host bridge + NAT + nftables policy (sudo)
 
 State lives in $AGENTBOX_HOME (default ~/.agentbox).
@@ -751,6 +795,7 @@ main() {
     allow)       cmd_allow "$@" ;;
     creds)       cmd_creds "$@" ;;
     egress-log)  cmd_egress_log "$@" ;;
+    netdiag)     cmd_netdiag "$@" ;;
     net)         cmd_net "$@" ;;
     image)       cmd_image "$@" ;;
     help|-h|--help) usage ;;

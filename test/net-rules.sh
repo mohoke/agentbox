@@ -97,7 +97,12 @@ deny() { # deny <description> <grep-pattern that must NOT appear>
 want "no box-to-box traffic"          'iifname "agbr0" oifname "agbr0" drop'
 want "host LAN unreachable"           'ip daddr \{ 10\.0\.0\.0/8.*192\.168\.0\.0/16.*\} drop'
 want "host services unreachable"      'iifname "agbr0" drop'
-want "DNS to host allowed"            'th dport 53 accept'
+want "DNS to host allowed (udp)"      'iifname "agbr0" udp dport 53 accept'
+want "DNS to host allowed (tcp)"      'iifname "agbr0" tcp dport 53 accept'
+# The combined `meta l4proto { tcp, udp } th dport 53` form loads cleanly but
+# does not match on some kernels, which silently broke DNS for every bridge box
+# while leaving icmp working. Never emit it again.
+deny "no unqualified l4proto dns rule" 'meta l4proto \{ tcp, udp \} th dport 53'
 want "return traffic allowed"         'ct state established,related accept'
 want "NAT masquerades the subnet"     'ip saddr 10\.77\.0\.0/24 oifname "wlan0" masquerade'
 
@@ -136,7 +141,7 @@ want "proxy box: may reach the proxy"   'ip saddr 10\.77\.0\.5 tcp dport 8123 ac
 # BEFORE the blanket DNS accept, or proxy mode silently keeps a DNS channel.
 IN=$(sed -n '/chain input/,/^  }/p' <<<"$RULES")
 p_drop=$(grep -n 'ip saddr 10\.77\.0\.5 drop' <<<"$IN" | head -1 | cut -d: -f1 || true)
-dns_ln=$(grep -n 'th dport 53 accept'          <<<"$IN" | head -1 | cut -d: -f1 || true)
+dns_ln=$(grep -n 'udp dport 53 accept'         <<<"$IN" | head -1 | cut -d: -f1 || true)
 if [[ -n $p_drop && -n $dns_ln && $p_drop -lt $dns_ln ]]; then
   printf '  \033[32mok\033[0m   proxy box denied DNS (drop at %s precedes accept at %s)\n' "$p_drop" "$dns_ln"
   pass=$((pass+1))
