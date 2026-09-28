@@ -122,9 +122,13 @@ here:
   arguments to `local` before running it, so `local a=$1 b="$a/x"` leaves `b`
   wrong — and under `set -u` it aborts the function mid-way. This shipped once
   and silently emptied a firewall allowlist.
-- Do not inline loops into cloud-init `runcmd`. Quoting through
-  bash → YAML → shell will corrupt them. Write a script file and call it; see
-  `image/run-layers.sh`.
+- Never build a file or a loop inside a cloud-init `runcmd`. Quoting through
+  bash → YAML → shell → printf will corrupt it, and it fails silently at boot
+  where nothing is watching. This has caused three separate bugs here: a layer
+  loop that lost its variable, and a systemd unit whose `$TERM` was expanded by
+  the *host* shell into a broken hex escape. Use `write_files` for file content
+  and a real script for logic; see `image/run-layers.sh` and the autologin unit
+  in `build_seed`.
 - Comments explain *why*, not *what*. If a line looks odd but is deliberate, say
   what goes wrong without it.
 - `bash -n` every file you touch. `shellcheck` if you have it.

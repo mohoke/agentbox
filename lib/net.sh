@@ -22,21 +22,23 @@ sudo_ok() { sudo -n true 2>/dev/null; }
 
 net_is_up() { ip link show "$AGENTBOX_BRIDGE" >/dev/null 2>&1; }
 
+# VPN clients and container runtimes reset ip_forward behind our back, which
+# silently kills egress for every bridge box with nothing in the logs to explain
+# it. Checked from both `net up` and `net refresh`, not just at box start.
+check_ip_forward() {
+  [[ $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) == 1 ]] && return 0
+  if sudo_ok; then
+    sudo sysctl -qw net.ipv4.ip_forward=1
+    warn "ip_forward had been reset to 0 (a VPN client is the usual cause); restored"
+  else
+    warn "ip_forward is 0, so no bridge box can reach the internet"
+    dim  "    restore with: sudo sysctl -w net.ipv4.ip_forward=1"
+  fi
+}
+
 require_net_up() {
   net_is_up || die "bridge $AGENTBOX_BRIDGE is down -- run: agentbox net up"
-  # VPN clients and container runtimes reset ip_forward behind our back, which
-  # silently kills egress for every bridge box. Re-assert it rather than leaving
-  # the user to discover it as "the network just stopped working".
-  if [[ $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) != 1 ]]; then
-    if sudo_ok; then
-      sudo sysctl -qw net.ipv4.ip_forward=1
-      warn "ip_forward had been reset to 0 (a VPN client usually does this); restored"
-    else
-      warn "ip_forward is 0, so bridge boxes cannot reach the internet"
-      dim  "    something reset it -- a VPN client is the usual cause. Restore with:"
-      dim  "        sudo sysctl -w net.ipv4.ip_forward=1"
-    fi
-  fi
+  check_ip_forward
 }
 
 # ---------------------------------------------------------------- bring up ---
@@ -124,6 +126,7 @@ box_allow_ips() {
 # ------------------------------------------------------------- nft ruleset ---
 net_apply() {
   net_is_up || return 0
+  check_ip_forward
   local up; up=$(uplink_iface)
   local rules; rules=$(mktemp)
 

@@ -29,14 +29,6 @@ else
   say "proxy env" "unset (direct egress expected)"
 fi
 
-# ----------------------------------------------------------------- routing --
-# An IP literal, so this says nothing about DNS.
-if code=$(timeout 8 curl -sS -o /dev/null -w '%{http_code}' https://1.1.1.1 2>/dev/null); then
-  say "routing (https to an IP)" "reachable, http $code"
-else
-  say "routing (https to an IP)" "UNREACHABLE"
-fi
-
 # --------------------------------------------------------------- resolver ---
 say "resolver the guest believes" "${cur:-none configured (probing $DNS)}"
 
@@ -73,6 +65,14 @@ if timeout 6 getent ahostsv4 example.com >/dev/null 2>&1; then
   say "name lookup (getent, ipv4)" "works"
 else
   say "name lookup (getent, ipv4)" "FAILS"
+fi
+
+# ----------------------------------------------------------------- routing --
+# An IP literal, so this says nothing about DNS.
+if code=$(timeout 6 curl -sS -o /dev/null -w '%{http_code}' https://1.1.1.1 2>/dev/null); then
+  say "routing (https to an IP)" "reachable, http $code"
+else
+  say "routing (https to an IP)" "UNREACHABLE"
 fi
 
 # ------------------------------------------------------------------ ipv6 ----

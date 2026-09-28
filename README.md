@@ -190,7 +190,9 @@ one repository over your personal token.
 ```sh
 agentbox ls                       # every box, state, address, workspace
 agentbox status myproj            # config, versions, disk usage
-agentbox logs myproj -f           # serial console, for boots that go wrong
+agentbox logs myproj -f           # serial console log, for boots that go wrong
+agentbox console myproj           # attach to the console; works when ssh does not
+agentbox netdiag myproj           # why the network is not working, host and guest
 agentbox agent myproj             # run claude in ~/workspace, attached
 agentbox down myproj              # graceful shutdown
 agentbox reset myproj             # wipe the VM disk, keep the workspace

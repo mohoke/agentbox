@@ -203,6 +203,23 @@ that ignores `HTTP_PROXY` connects directly, and nftables drops it — so it fai
 closed, but with a timeout instead of a clear error. Check `agentbox egress-log`:
 if the host does not appear there at all, the client bypassed the proxy.
 
+**The box is unreachable over ssh.** Networking is the most common thing to
+break in a box, and ssh is how you would normally investigate it -- so use the
+serial console instead, which does not depend on the guest's network at all:
+
+```sh
+agentbox console <box>          # Ctrl-] to detach
+```
+
+It logs in as `agent` automatically. The socket lives under `~/.agentbox` and is
+reachable only by you, so it grants nothing beyond what the box's ssh key
+already would. From there, `ip addr`, `ip route` and `systemctl status
+systemd-networkd` tell you what the guest thinks its network is.
+
+A box created before console support was added has no console socket. Give it
+one with `agentbox reseed <box>` followed by `down` and `up` -- the reseed is
+what makes cloud-init re-run and set up the autologin.
+
 **The policy will not reload.** `net_apply` needs non-interactive sudo. If it
 warns, the previously loaded rules are still in force; run
 `sudo -v && agentbox net refresh`.

@@ -307,6 +307,14 @@ build_seed() {
     echo "    permissions: '0644'"
     echo "    content: |"
     echo "      $(cat "$bd/id_ed25519.pub")"
+    echo "  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf"
+    echo "    permissions: '0644'"
+    echo "    content: |"
+    echo "      [Service]"
+    echo "      ExecStart="
+    # Single-quoted so the host shell leaves %I and $TERM for systemd/agetty.
+    echo '      ExecStart=-/sbin/agetty --autologin agent --keep-baud 115200,57600,38400,9600 %I $TERM'
+    echo "      Type=idle"
     echo "  - path: /etc/agentbox/box.env"
     echo "    permissions: '0644'"
     echo "    content: |"
@@ -332,6 +340,7 @@ build_seed() {
     # workspace is mounted even if the unit ordering raced on first boot.
     echo "  - [ bash, -lc, 'mountpoint -q /home/agent/workspace || mount /home/agent/workspace || true' ]"
     echo "  - [ bash, -lc, 'chown agent:agent /home/agent/scratch' ]"
+    echo "  - [ bash, -lc, 'systemctl daemon-reload && systemctl restart serial-getty@ttyS0.service' ]"
     if [[ $BOX_EGRESS == proxy ]]; then
       local purl2="http://$AGENTBOX_HOST_IP:$(box_proxy_port "$BOX_INDEX")"
       echo "  - [ bash, -lc, 'grep -q agentbox-proxy /etc/environment || printf \"http_proxy=$purl2\\nhttps_proxy=$purl2\\nHTTP_PROXY=$purl2\\nHTTPS_PROXY=$purl2\\nno_proxy=localhost,127.0.0.1\\n# agentbox-proxy\\n\" >> /etc/environment' ]"
@@ -420,7 +429,8 @@ cmd_up() {
     "${fsargs[@]}" \
     -device virtio-rng-pci \
     -qmp "unix:$bd/run/qmp.sock,server=on,wait=off" \
-    -serial "file:$bd/run/console.log" \
+    -chardev "socket,id=ser0,path=$bd/run/console.sock,server=on,wait=off,logfile=$bd/run/console.log" \
+    -serial chardev:ser0 \
     -display none -pidfile "$bd/run/qemu.pid" -daemonize \
     || die "qemu failed to start"
 
@@ -452,7 +462,8 @@ cmd_down() {
     if box_running "$bd"; then warn "graceful shutdown timed out; killing"; kill -9 "$pid" 2>/dev/null || true; fi
   fi
   if [[ -s $bd/run/virtiofsd.pid ]]; then kill "$(<"$bd/run/virtiofsd.pid")" 2>/dev/null || true; fi
-  rm -f "$bd/run/virtiofsd.pid" "$bd/run/qemu.pid" "$bd/run/qmp.sock" "$bd/run/vfs.sock"
+  rm -f "$bd/run/virtiofsd.pid" "$bd/run/qemu.pid" "$bd/run/qmp.sock" \
+        "$bd/run/vfs.sock" "$bd/run/console.sock"
   proxy_stop "$BOX_DIR"
   if [[ $BOX_NET == bridge ]]; then
     [[ -n ${BOX_UPLINK-} ]] && vpn_route_clear "$BOX_IP" "$BOX_INDEX"
@@ -637,6 +648,47 @@ cmd_allow() {
   net_is_up && net_apply || true
 }
 
+# ============================================================== console =====
+cmd_console() {
+  local name="${1-}"
+  [[ -n $name ]] || die "usage: agentbox console <name>"
+  load_box "$name"
+  box_running "$BOX_DIR" || die "box '$name' is not running"
+  local sock="$BOX_DIR/run/console.sock"
+  [[ -S $sock ]] || die "no console socket; this box predates console support -- restart it:
+    agentbox down $name && agentbox up $name"
+
+  log "attached to $name's serial console -- Ctrl-] to detach"
+  python3 - "$sock" <<'PY'
+import os, socket, sys, termios, tty, select
+sock_path = sys.argv[1]
+s = socket.socket(socket.AF_UNIX); s.connect(sock_path)
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd) if os.isatty(fd) else None
+try:
+    if saved:
+        tty.setraw(fd)
+    s.sendall(b"\r")                      # nudge the getty into printing a prompt
+    while True:
+        r, _, _ = select.select([s, fd], [], [])
+        if s in r:
+            data = s.recv(4096)
+            if not data:
+                break
+            os.write(sys.stdout.fileno(), data)
+        if fd in r:
+            data = os.read(fd, 1024)
+            if not data or b"\x1d" in data:   # Ctrl-]
+                break
+            s.sendall(data)
+finally:
+    if saved:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    s.close()
+    sys.stderr.write("\r\n")
+PY
+}
+
 # ============================================================== netdiag =====
 cmd_netdiag() {
   local name="${1-}"
@@ -753,7 +805,9 @@ agentbox -- one disposable KVM microVM per project, for coding agents.
 
   ls                             list boxes
   status <name>                  detail for one box
-  logs <name> [-f]               serial console
+  logs <name> [-f]               serial console log (read-only)
+  console <name>                 attach to the serial console; the way in when
+                                 the guest's network stops answering
 
   ssh <name> [-- cmd...]         shell in as `agent`
   agent <name> [args...]         run claude in ~/workspace
@@ -796,6 +850,7 @@ main() {
     creds)       cmd_creds "$@" ;;
     egress-log)  cmd_egress_log "$@" ;;
     netdiag)     cmd_netdiag "$@" ;;
+    console)     cmd_console "$@" ;;
     net)         cmd_net "$@" ;;
     image)       cmd_image "$@" ;;
     help|-h|--help) usage ;;
