@@ -78,6 +78,44 @@ creds_push() {
       < "$CRED_SRC" \
     || { warn "credential push failed"; return 1; }
 
+  # Mark onboarding complete in the guest.
+  #
+  # A valid token is not sufficient for the interactive CLI: without
+  # hasCompletedOnboarding in ~/.claude.json it runs first-run setup, whose
+  # opening screen is the authentication prompt. The result looks exactly like
+  # a rejected credential -- `claude -p` works while `claude` asks you to log
+  # in. Only these two keys are set; ~/.claude.json on the host also holds the
+  # per-project history of everything else you work on, which has no business
+  # in a box.
+  local onboard_version
+  onboard_version=$(python3 -c "
+import json, sys
+try:
+    print(json.load(open('$HOME/.claude.json')).get('lastOnboardingVersion', '') or '')
+except Exception:
+    print('')" 2>/dev/null)
+  # shellcheck disable=SC2086
+  ssh -F "$SSH_CONFIG" $(ssh_opts) -o BatchMode=yes "$name" \
+      "python3 - $(printf '%q' "$onboard_version")" 2>/dev/null <<'PY' || \
+        warn "could not mark onboarding complete; the box may show the setup screen"
+import json, os, sys
+path = os.path.expanduser("~/.claude.json")
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    data = {}
+data["hasCompletedOnboarding"] = True
+version = sys.argv[1] if len(sys.argv) > 1 else ""
+if version:
+    data["lastOnboardingVersion"] = version
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(data, fh, indent=2)
+os.replace(tmp, path)
+os.chmod(path, 0o600)
+PY
+
   # Git identity is configuration, not a secret, but commits are wrong without it.
   local gname gmail
   gname=$(git config --global user.name  2>/dev/null || true)
