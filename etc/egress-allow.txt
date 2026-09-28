@@ -1,0 +1,35 @@
+# Default egress allowlist for boxes created with --egress allow.
+# One host per line; comments and blank lines ignored. Resolved to IPs by
+# `agentbox net refresh`, which runs on `net up` and every `agentbox up`.
+#
+# Caveat worth knowing: this filters by resolved IP, so any domain sharing a
+# CDN address with an allowed one is reachable too. It raises the cost of
+# casual exfiltration; it is not a hard information barrier. For that, run the
+# box with --egress none and hand it what it needs through ~/workspace.
+
+# Claude / Anthropic
+api.anthropic.com
+statsig.anthropic.com
+claude.ai
+console.anthropic.com
+
+# opencode
+opencode.ai
+api.opencode.ai
+
+# Package registries
+registry.npmjs.org
+pypi.org
+files.pythonhosted.org
+astral.sh
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
+ghcr.io
+
+# Distro
+archive.ubuntu.com
+security.ubuntu.com
+deb.nodesource.com

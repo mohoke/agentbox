@@ -1,0 +1,6 @@
+# Rust: rustup and the crates.io index and CDN.
+static.rust-lang.org
+sh.rustup.rs
+crates.io
+static.crates.io
+index.crates.io

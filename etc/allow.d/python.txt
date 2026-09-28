@@ -1,0 +1,4 @@
+# Python: PyPI, uv, and the package CDN.
+pypi.org
+files.pythonhosted.org
+astral.sh

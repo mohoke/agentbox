@@ -1,0 +1,6 @@
+#!/bin/bash
+# Example layer: extra CLI tools. Rename without .disabled to enable.
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get -y install --no-install-recommends httpie ncdu tree

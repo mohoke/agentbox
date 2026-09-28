@@ -1,0 +1,759 @@
+#!/usr/bin/env bash
+# agentbox -- one disposable KVM microVM per project, for coding agents.
+# See docs/DESIGN.md for why it is built this way.
+
+set -euo pipefail
+
+AGENTBOX_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+export AGENTBOX_ROOT
+# shellcheck source=../lib/common.sh
+source "$AGENTBOX_ROOT/lib/common.sh"
+load_config
+# shellcheck source=../lib/net.sh
+source "$AGENTBOX_ROOT/lib/net.sh"
+# shellcheck source=../lib/egress.sh
+source "$AGENTBOX_ROOT/lib/egress.sh"
+# shellcheck source=../lib/image.sh
+source "$AGENTBOX_ROOT/lib/image.sh"
+# shellcheck source=../lib/creds.sh
+source "$AGENTBOX_ROOT/lib/creds.sh"
+
+CLOUD_IMG_URL_BASE=${CLOUD_IMG_URL_BASE:-https://cloud-images.ubuntu.com/releases}
+
+# ============================================================== doctor ======
+cmd_doctor() {
+  local fail=0
+  chk() { # chk <label> <ok?> <hint>
+    if [[ $2 == 1 ]]; then ok "$1"
+    else printf '%sfail%s %-28s %s\n' "$C_RED" "$C_OFF" "$1" "${3:-}" >&2; fail=1; fi
+  }
+
+  chk "kvm accessible" "$([[ -r /dev/kvm && -w /dev/kvm ]] && echo 1 || echo 0)" \
+      "add yourself to the kvm group: sudo usermod -aG kvm $USER"
+  chk "qemu-system-x86_64" "$(command -v qemu-system-x86_64 >/dev/null && echo 1 || echo 0)" \
+      "sudo apt install qemu-system-x86"
+  chk "qemu-img" "$(command -v qemu-img >/dev/null && echo 1 || echo 0)" "sudo apt install qemu-utils"
+  chk "virtiofsd ($VIRTIOFSD)" "$([[ -x $VIRTIOFSD ]] && echo 1 || echo 0)" "sudo apt install virtiofsd"
+  chk "xorriso" "$(command -v xorriso >/dev/null && echo 1 || echo 0)" "sudo apt install xorriso"
+  chk "ssh client" "$(command -v ssh >/dev/null && echo 1 || echo 0)" "sudo apt install openssh-client"
+  chk "jq" "$(command -v jq >/dev/null && echo 1 || echo 0)" "sudo apt install jq"
+
+  # Bridge mode only; slirp boxes work without any of this.
+  if command -v nft >/dev/null && command -v dnsmasq >/dev/null; then
+    ok "nft + dnsmasq (bridge mode available)"
+  else
+    warn "nft or dnsmasq missing -- only --net slirp will work"
+  fi
+
+  if [[ -f $BASE_IMAGE ]]; then
+    ok "base image $(du -h "$BASE_IMAGE" | cut -f1) built $(jq -r .built "$BASE_MANIFEST" 2>/dev/null || echo '?')"
+  else
+    warn "no base image yet -- run: agentbox build"
+  fi
+
+  if grep -qs "Include $SSH_CONFIG" "$HOME/.ssh/config"; then
+    ok "~/.ssh/config includes agentbox hosts"
+  else
+    warn "~/.ssh/config does not include agentbox hosts (needed for VS Code)"
+    dim "    fix with: agentbox ssh-config --install"
+  fi
+
+  local avail; avail=$(df -BG --output=avail "$AGENTBOX_HOME" 2>/dev/null | tail -1 | tr -dc 0-9)
+  if [[ ${avail:-0} -lt 30 ]]; then
+    warn "only ${avail}G free under $AGENTBOX_HOME (base image needs ~8G, each box grows from there)"
+  else
+    ok "${avail}G free under $AGENTBOX_HOME"
+  fi
+
+  return $fail
+}
+
+# =============================================================== build ======
+fetch_cloud_image() {
+  local rel=$1
+  local img="ubuntu-$rel-server-cloudimg-amd64.img"
+  local url="$CLOUD_IMG_URL_BASE/$rel/release/$img"
+  local dest="$CACHE_DIR/$img"
+  if [[ -s $dest ]]; then
+    dim "using cached $img"
+    printf '%s' "$dest"; return
+  fi
+
+  # The Ubuntu CDN likes to go quiet mid-transfer without dropping the
+  # connection, so resume against a known total rather than trusting one curl.
+  local want
+  want=$(curl -fsSLI "$url" | tr -d '\r' \
+         | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {n=$2} END {print n+0}')
+  [[ ${want:-0} -gt 0 ]] && log "downloading Ubuntu $rel cloud image ($((want/1048576))M, once)" \
+                         || log "downloading Ubuntu $rel cloud image (once)"
+
+  local tries=0 have=0
+  while :; do
+    have=$(stat -c %s "$dest.part" 2>/dev/null || echo 0)
+    [[ ${want:-0} -gt 0 && $have -eq $want ]] && break
+    (( ++tries <= 20 )) || die "download kept stalling ($have/$want bytes) -- retry: agentbox build"
+    (( tries > 1 )) && warn "stalled at $((have/1048576))M; resuming (attempt $tries)"
+    # --speed-time turns a silent stall into an error curl will actually retry.
+    curl -fL --progress-bar -C - --retry 5 --retry-delay 2 --retry-all-errors \
+         --speed-limit 51200 --speed-time 30 -o "$dest.part" "$url" && \
+         [[ ${want:-0} -eq 0 ]] && break
+    true
+  done
+  mv "$dest.part" "$dest"
+  printf '%s' "$dest"
+}
+
+make_seed_iso() {
+  # make_seed_iso <out.iso> <user-data-file> [network-config-file]
+  local out=$1 userdata=$2 netcfg=${3:-}
+  local d; d=$(mktemp -d)
+  cp "$userdata" "$d/user-data"
+  printf 'instance-id: %s\nlocal-hostname: %s\n' "$(basename "$out" .iso)-$(date +%s)" \
+        "${SEED_HOSTNAME:-agentbox}" > "$d/meta-data"
+  [[ -n $netcfg ]] && cp "$netcfg" "$d/network-config"
+  xorriso -as mkisofs -quiet -output "$out" -volid CIDATA -joliet -rock "$d" >/dev/null
+  rm -rf "$d"
+}
+
+cmd_build() {
+  local rel=$AGENTBOX_RELEASE force=0
+  while [[ $# -gt 0 ]]; do case $1 in
+    --release) rel=$2; shift 2 ;;
+    --force|-f) force=1; shift ;;
+    *) die "build: unknown option $1" ;;
+  esac; done
+
+  [[ -f $BASE_IMAGE && $force == 0 ]] && die "base image exists; rebuild with: agentbox build --force"
+  [[ -r /dev/kvm ]] || die "no access to /dev/kvm -- run: agentbox doctor"
+
+  local src; src=$(fetch_cloud_image "$rel")
+  local work="$IMAGES_DIR/build.qcow2" console="$IMAGES_DIR/build-console.log"
+  rm -f "$work" "$console"
+
+  log "preparing a ${AGENTBOX_BASE_DISK_GB}G working image"
+  qemu-img create -f qcow2 -F qcow2 -b "$src" "$work" "${AGENTBOX_BASE_DISK_GB}G" >/dev/null
+
+  # cloud-init carries the provisioning script in, runs it, and powers off.
+  local ud; ud=$(mktemp)
+  {
+    echo "#cloud-config"
+    echo "ssh_pwauth: false"
+    echo "write_files:"
+    echo "  - path: /root/agentbox-provision.sh"
+    echo "    permissions: '0755'"
+    echo "    encoding: b64"
+    echo "    content: $(base64 -w0 "$AGENTBOX_ROOT/image/provision.sh")"
+    echo "  - path: /root/run-layers.sh"
+    echo "    permissions: '0755'"
+    echo "    encoding: b64"
+    echo "    content: $(base64 -w0 "$AGENTBOX_ROOT/image/run-layers.sh")"
+    echo "  - path: /tmp/agentbox-CLAUDE.md"
+    echo "    permissions: '0644'"
+    echo "    encoding: b64"
+    echo "    content: $(base64 -w0 "$AGENTBOX_ROOT/image/CLAUDE.md")"
+    local layer
+    for layer in "$AGENTBOX_ROOT"/image/layers/*.sh; do
+      [[ -f $layer ]] || continue
+      echo "  - path: /root/layers/$(basename "$layer")"
+      echo "    permissions: '0755'"
+      echo "    encoding: b64"
+      echo "    content: $(base64 -w0 "$layer")"
+    done
+    echo "runcmd:"
+    echo "  - [ bash, -lc, \"NODE_MAJOR=$AGENTBOX_NODE_MAJOR /root/agentbox-provision.sh && echo AGENTBOX_PROVISION_OK > /dev/console || echo AGENTBOX_PROVISION_FAIL > /dev/console\" ]"
+    # Layers run after the base provisioning, in filename order; a failure in
+    # any of them fails the build rather than sealing a half-built image.
+    echo "  - [ bash, -lc, \"/root/run-layers.sh\" ]"
+    echo "  - [ bash, -lc, \"rm -rf /root/agentbox-provision.sh /root/layers /root/run-layers.sh; sync; poweroff\" ]"
+  } > "$ud"
+  SEED_HOSTNAME=agentbox-build make_seed_iso "$IMAGES_DIR/build-seed.iso" "$ud"
+  rm -f "$ud"
+
+  log "provisioning (installs python, node, postgres, claude, opencode -- ~8-15 min)"
+  dim "    follow along: tail -f $console"
+  qemu-system-x86_64 \
+    -name agentbox-build -machine q35,accel=kvm -cpu host -smp 4 -m 4096 \
+    -drive "file=$work,if=virtio,format=qcow2,discard=unmap,cache=writeback" \
+    -drive "file=$IMAGES_DIR/build-seed.iso,if=virtio,format=raw,readonly=on" \
+    -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+    -serial "file:$console" -display none -no-reboot \
+    || die "build VM failed to run (see $console)"
+
+  grep -q AGENTBOX_PROVISION_OK "$console" \
+    || die "provisioning did not complete -- inspect $console"
+  if grep -q AGENTBOX_LAYER_FAIL "$console"; then
+    die "a layer in image/layers/ failed -- inspect $console"
+  fi
+
+  log "sealing base image"
+  qemu-img convert -O qcow2 "$work" "$BASE_IMAGE.tmp"
+  rm -f "$BASE_IMAGE"          # it is mode 444; mv would stop to ask
+  mv "$BASE_IMAGE.tmp" "$BASE_IMAGE"
+  chmod 444 "$BASE_IMAGE"        # boxes only ever use it as a CoW backing file
+  rm -f "$work" "$IMAGES_DIR/build-seed.iso"
+
+  jq -n --arg rel "$rel" --arg built "$(date -Is)" --arg node "$AGENTBOX_NODE_MAJOR" \
+     '{release:$rel, built:$built, node:$node}' > "$BASE_MANIFEST"
+  image_record "build" "ubuntu $rel, node $AGENTBOX_NODE_MAJOR"
+  ok "base image ready: $BASE_IMAGE ($(du -h "$BASE_IMAGE" | cut -f1))"
+}
+
+# ============================================================== create ======
+cmd_create() {
+  local name= ws= cpus=$AGENTBOX_CPUS mem=$AGENTBOX_MEM_MB disk= net=$AGENTBOX_NET
+  local egress=$AGENTBOX_EGRESS ports=() vpn= creds=$AGENTBOX_CREDS bundles=()
+  while [[ $# -gt 0 ]]; do case $1 in
+    --workspace|-w) ws=$2; shift 2 ;;
+    --cpus)   cpus=$2; shift 2 ;;
+    --mem)    mem=$2; shift 2 ;;
+    --disk)   disk=$2; shift 2 ;;
+    --net)    net=$2; shift 2 ;;
+    --egress) egress=$2; shift 2 ;;
+    --vpn)    vpn=$2; shift 2 ;;
+    --creds)  creds=$2; shift 2 ;;
+    --allow)  bundles+=("$2"); shift 2 ;;
+    --port|-p) ports+=("$2"); shift 2 ;;
+    -*) die "create: unknown option $1" ;;
+    *) [[ -z $name ]] || die "create: unexpected argument $1"; name=$1; shift ;;
+  esac; done
+
+  [[ -n $name ]] || die "usage: agentbox create <name> [--workspace DIR] [--net slirp|bridge]"
+  [[ $name =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "box name must be lowercase alphanumeric/dashes"
+  [[ -d $(box_dir "$name") ]] && die "box '$name' already exists"
+  [[ -f $BASE_IMAGE ]] || die "no base image -- run: agentbox build"
+  [[ $net == slirp || $net == bridge ]] || die "--net must be slirp or bridge"
+  [[ $egress =~ ^(open|allow|proxy|none)$ ]] || die "--egress must be open, allow, proxy or none"
+  if [[ -n $vpn ]]; then
+    [[ $net == bridge ]] || die "--vpn requires --net bridge"
+    ip link show "$vpn" >/dev/null 2>&1 || die "no such interface: $vpn"
+  fi
+  [[ $egress == proxy && $net != bridge ]] && die "--egress proxy requires --net bridge"
+  [[ $creds =~ ^(share|none)$ ]] || die "--creds must be share or none"
+
+  local idx; idx=$(alloc_index)
+  local bd; bd=$(box_dir "$name")
+  mkdir -p "$bd/run"
+
+  # The workspace is the one directory that outlives the VM, so it lives on the
+  # host: git, backups and the user's editor all keep working normally.
+  if [[ -n $ws ]]; then
+    mkdir -p "$ws"; ws=$(cd "$ws" && pwd)
+  else
+    ws="$bd/workspace"; mkdir -p "$ws"
+  fi
+
+  log "creating box '$name' (index $idx)"
+  ssh-keygen -q -t ed25519 -N '' -C "agentbox-$name" -f "$bd/id_ed25519"
+
+  qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMAGE" "$bd/disk.qcow2" \
+    ${disk:+"${disk}G"} >/dev/null
+  cp "$AGENTBOX_ROOT/etc/egress-allow.txt" "$bd/allow.txt"
+  local b
+  for b in ${bundles[@]+"${bundles[@]}"}; do apply_bundle "$bd" "$b"; done
+
+  local mac ip sshport
+  mac=$(printf '52:54:00:ab:00:%02x' "$idx")
+  ip="$AGENTBOX_SUBNET.$idx"
+  sshport=$((AGENTBOX_SSH_PORT_BASE + idx))
+
+  cat > "$bd/box.conf" <<EOF
+# agentbox box config. CPU/memory/ports apply on the next \`up\`; changing the
+# network or egress needs \`agentbox reseed $name\` to rebuild the cloud-init seed.
+BOX_INDEX=$idx
+BOX_NET=$net
+BOX_EGRESS=$egress
+BOX_IP=$ip
+BOX_MAC=$mac
+BOX_SSH_PORT=$sshport
+BOX_CPUS=$cpus
+BOX_MEM_MB=$mem
+BOX_WORKSPACE=$ws
+BOX_PORTS=${ports[*]-}
+BOX_UPLINK=$vpn
+BOX_CREDS=$creds
+BOX_CREATED=$(date -Is)
+EOF
+
+  build_seed "$name"
+  regen_ssh_config
+
+  ok "box '$name' created"
+  printf '  workspace  %s  (shared into the VM at ~/workspace)\n' "$ws" >&2
+  printf '  network    %s%s\n' "$net" \
+         "$([[ $net == bridge ]] && echo " ip=$ip egress=$egress" || echo " ssh=127.0.0.1:$sshport")" >&2
+  creds_warn_once "$creds"
+  dim "  next: agentbox up $name"
+}
+
+build_seed() {
+  # Per-box cloud-init: identity, ssh key, and network. Re-runs on every boot
+  # because the base image was sealed with `cloud-init clean`.
+  local name=$1 bd; bd=$(box_dir "$name")
+  # shellcheck disable=SC1090
+  source "$bd/box.conf"
+
+  local ud; ud=$(mktemp)
+  {
+    echo "#cloud-config"
+    echo "hostname: $name"
+    echo "preserve_hostname: false"
+    echo "ssh_pwauth: false"
+    # Deliberately no `users:` block. The agent account (uid 1000, sudo, shell)
+    # is baked into the base image, and cloud-init's create_user short-circuits
+    # on an existing user -- whether it still installs ssh_authorized_keys is
+    # version-dependent. Placing the key by hand below is unambiguous.
+    echo "write_files:"
+    echo "  - path: /etc/agentbox/authorized_keys"
+    echo "    permissions: '0644'"
+    echo "    content: |"
+    echo "      $(cat "$bd/id_ed25519.pub")"
+    echo "  - path: /etc/agentbox/box.env"
+    echo "    permissions: '0644'"
+    echo "    content: |"
+    echo "      AGENTBOX_NAME=$name"
+    echo "      AGENTBOX_EGRESS=$BOX_EGRESS"
+    if [[ $BOX_EGRESS == proxy ]]; then
+      local purl="http://$AGENTBOX_HOST_IP:$(box_proxy_port "$BOX_INDEX")"
+      echo "  - path: /etc/apt/apt.conf.d/01agentbox-proxy"
+      echo "    permissions: '0644'"
+      echo "    content: |"
+      echo "      Acquire::http::Proxy \"$purl\";"
+      echo "      Acquire::https::Proxy \"$purl\";"
+      echo "  - path: /etc/profile.d/agentbox-proxy.sh"
+      echo "    permissions: '0644'"
+      echo "    content: |"
+      echo "      export http_proxy=$purl https_proxy=$purl"
+      echo "      export HTTP_PROXY=$purl HTTPS_PROXY=$purl"
+      echo "      export no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1"
+    fi
+    echo "runcmd:"
+    echo "  - [ bash, -lc, 'install -d -o agent -g agent -m 0700 /home/agent/.ssh && install -o agent -g agent -m 0600 /etc/agentbox/authorized_keys /home/agent/.ssh/authorized_keys' ]"
+    # The base image was built before this box existed; make sure the shared
+    # workspace is mounted even if the unit ordering raced on first boot.
+    echo "  - [ bash, -lc, 'mountpoint -q /home/agent/workspace || mount /home/agent/workspace || true' ]"
+    echo "  - [ bash, -lc, 'chown agent:agent /home/agent/scratch' ]"
+    if [[ $BOX_EGRESS == proxy ]]; then
+      local purl2="http://$AGENTBOX_HOST_IP:$(box_proxy_port "$BOX_INDEX")"
+      echo "  - [ bash, -lc, 'grep -q agentbox-proxy /etc/environment || printf \"http_proxy=$purl2\\nhttps_proxy=$purl2\\nHTTP_PROXY=$purl2\\nHTTPS_PROXY=$purl2\\nno_proxy=localhost,127.0.0.1\\n# agentbox-proxy\\n\" >> /etc/environment' ]"
+    fi
+    # Self-healing: puts the agent CLIs on the default PATH even on a box built
+    # from a base image that predates /usr/local/sbin/agentbox-link-tools.
+    echo "  - [ bash, -lc, 'for b in /home/agent/.local/bin/claude /home/agent/.local/bin/uv /home/agent/.local/bin/uvx /home/agent/.opencode/bin/opencode; do [ -e \"\$b\" ] && ln -sfn \"\$b\" /usr/local/bin/\$(basename \"\$b\"); done; true' ]"
+  } > "$ud"
+
+  local nc; nc=$(mktemp)
+  {
+    echo "version: 2"
+    echo "ethernets:"
+    echo "  primary:"
+    echo "    match:"
+    echo "      macaddress: \"$BOX_MAC\""
+    echo "    set-name: eth0"
+    if [[ $BOX_NET == bridge ]]; then
+      echo "    dhcp4: false"
+      echo "    addresses: [$BOX_IP/24]"
+      echo "    routes: [{to: default, via: $AGENTBOX_HOST_IP}]"
+      echo "    nameservers: {addresses: [$AGENTBOX_DNS]}"
+    else
+      echo "    dhcp4: true"
+    fi
+  } > "$nc"
+
+  SEED_HOSTNAME=$name make_seed_iso "$bd/seed.iso" "$ud" "$nc"
+  rm -f "$ud" "$nc"
+}
+
+# ================================================================== up ======
+cmd_up() {
+  load_box "${1:?usage: agentbox up <name>}"
+  local bd=$BOX_DIR
+  box_running "$bd" && { ok "box '$BOX_NAME' already running"; return 0; }
+  rm -f "$bd/run/qemu.pid" "$bd/run/qmp.sock" "$bd/run/vfs.sock"
+
+  local netdev
+  if [[ $BOX_NET == bridge ]]; then
+    require_net_up
+    tap_up "$BOX_INDEX"
+    if [[ -n ${BOX_UPLINK-} ]]; then
+      log "pinning egress to $BOX_UPLINK (kill switch: no fallback to default route)"
+      vpn_route_apply "$BOX_IP" "$BOX_INDEX" "$BOX_UPLINK"
+    fi
+    [[ $BOX_EGRESS == proxy ]] && proxy_start "$BOX_DIR" "$BOX_INDEX"
+    net_apply                           # refresh this box's allowlist set
+    netdev="tap,id=n0,ifname=ag$BOX_INDEX,script=no,downscript=no"
+  else
+    netdev="user,id=n0,hostfwd=tcp:127.0.0.1:$BOX_SSH_PORT-:22"
+    local p                             # extra host:guest forwards
+    for p in ${BOX_PORTS-}; do
+      netdev+=",hostfwd=tcp:127.0.0.1:${p%%:*}-:${p##*:}"
+    done
+  fi
+
+  # virtiofsd exports the host workspace dir. --sandbox none because this host
+  # restricts unprivileged user namespaces; the daemon runs as the invoking
+  # user and can therefore only reach files that user can already reach.
+  local fsargs=()
+  if [[ -n ${BOX_WORKSPACE-} && -d ${BOX_WORKSPACE-} ]]; then
+    log "sharing $BOX_WORKSPACE"
+    setsid "$VIRTIOFSD" --socket-path="$bd/run/vfs.sock" \
+        --shared-dir="$BOX_WORKSPACE" --sandbox none --cache auto \
+        >"$bd/run/virtiofsd.log" 2>&1 &
+    echo $! > "$bd/run/virtiofsd.pid"
+    local t=0
+    while [[ ! -S $bd/run/vfs.sock && $t -lt 50 ]]; do sleep 0.1; t=$((t+1)); done
+    [[ -S $bd/run/vfs.sock ]] || die "virtiofsd did not start (see $bd/run/virtiofsd.log)"
+    fsargs=(-chardev "socket,id=vfs0,path=$bd/run/vfs.sock"
+            -device  "vhost-user-fs-pci,chardev=vfs0,tag=workspace,queue-size=1024")
+  fi
+
+  log "starting $BOX_NAME (${BOX_CPUS} vcpu, ${BOX_MEM_MB}M)"
+  qemu-system-x86_64 \
+    -name "agentbox-$BOX_NAME" \
+    -machine q35,accel=kvm,memory-backend=mem \
+    -cpu host -smp "$BOX_CPUS" -m "$BOX_MEM_MB" \
+    -object "memory-backend-memfd,id=mem,size=${BOX_MEM_MB}M,share=on" \
+    -drive "file=$bd/disk.qcow2,if=virtio,format=qcow2,discard=unmap,cache=writeback" \
+    -drive "file=$bd/seed.iso,if=virtio,format=raw,readonly=on" \
+    -netdev "$netdev" -device "virtio-net-pci,netdev=n0,mac=$BOX_MAC" \
+    "${fsargs[@]}" \
+    -device virtio-rng-pci \
+    -qmp "unix:$bd/run/qmp.sock,server=on,wait=off" \
+    -serial "file:$bd/run/console.log" \
+    -display none -pidfile "$bd/run/qemu.pid" -daemonize \
+    || die "qemu failed to start"
+
+  log "waiting for ssh"
+  if wait_for_ssh "$bd" 240; then
+    if [[ ${BOX_CREDS-share} == share ]]; then
+      creds_push "$BOX_NAME" >/dev/null 2>&1 \
+        && dim "  creds      host Claude token copied in (agentbox creds $BOX_NAME clear to remove)" \
+        || warn "credential push failed; run 'claude' inside the box to log in"
+    fi
+    ok "box '$BOX_NAME' is up"
+    printf '  ssh        agentbox ssh %s\n' "$BOX_NAME" >&2
+    printf '  vs code    agentbox code %s\n' "$BOX_NAME" >&2
+  else
+    warn "box started but ssh never answered -- agentbox logs $BOX_NAME"
+    return 1
+  fi
+}
+
+# ================================================================ down ======
+cmd_down() {
+  load_box "${1:?usage: agentbox down <name>}"
+  local bd=$BOX_DIR pid
+  if pid=$(box_pid "$bd"); then
+    log "shutting down $BOX_NAME"
+    qmp "$bd" '{"execute":"system_powerdown"}' >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
+    local t=0
+    while box_running "$bd" && (( t < 60 )); do sleep 1; t=$((t+1)); done
+    if box_running "$bd"; then warn "graceful shutdown timed out; killing"; kill -9 "$pid" 2>/dev/null || true; fi
+  fi
+  if [[ -s $bd/run/virtiofsd.pid ]]; then kill "$(<"$bd/run/virtiofsd.pid")" 2>/dev/null || true; fi
+  rm -f "$bd/run/virtiofsd.pid" "$bd/run/qemu.pid" "$bd/run/qmp.sock" "$bd/run/vfs.sock"
+  proxy_stop "$BOX_DIR"
+  if [[ $BOX_NET == bridge ]]; then
+    [[ -n ${BOX_UPLINK-} ]] && vpn_route_clear "$BOX_IP" "$BOX_INDEX"
+    tap_down "$BOX_INDEX"
+  fi
+  ok "box '$BOX_NAME' stopped"
+}
+
+# ================================================================== ls ======
+cmd_ls() {
+  local n
+  printf '%-16s %-8s %-7s %-20s %s\n' NAME STATE NET ADDRESS WORKSPACE
+  for n in $(list_boxes); do
+    # shellcheck disable=SC1090
+    ( source "$(box_conf "$n")"
+      local state col addr
+      # Colour codes are zero-width on screen but not to printf, so pad the
+      # plain word and wrap the padded result.
+      if box_running "$(box_dir "$n")"; then state=up; col=$C_GRN; else state=down; col=$C_DIM; fi
+      if [[ $BOX_NET == bridge ]]; then addr="$BOX_IP ($BOX_EGRESS)"; else addr="127.0.0.1:$BOX_SSH_PORT"; fi
+      printf '%-16s %b%-8s%b %-7s %-20s %s\n' \
+        "$n" "$col" "$state" "$C_OFF" "$BOX_NET" "$addr" "${BOX_WORKSPACE/#$HOME/\~}" )
+  done
+}
+
+cmd_status() {
+  load_box "${1:?usage: agentbox status <name>}"
+  cat "$(box_conf "$BOX_NAME")"
+  if box_running "$BOX_DIR"; then
+    printf 'STATE=running pid=%s\n' "$(box_pid "$BOX_DIR")"
+    # shellcheck disable=SC2086
+    ssh -F "$SSH_CONFIG" $(ssh_opts) "$BOX_NAME" box-info 2>/dev/null || true
+  else
+    printf 'STATE=stopped\n'
+  fi
+  printf 'DISK=%s (overlay) BASE=%s\n' \
+    "$(du -h "$BOX_DIR/disk.qcow2" | cut -f1)" "$(du -h "$BASE_IMAGE" | cut -f1)"
+}
+
+# ============================================================ ssh/exec ======
+cmd_ssh() {
+  local name=${1:?usage: agentbox ssh <name> [-- command...]}; shift || true
+  load_box "$name"
+  box_running "$BOX_DIR" || die "box '$name' is not running -- agentbox up $name"
+  [[ ${1-} == -- ]] && shift
+  # shellcheck disable=SC2086
+  exec ssh -F "$SSH_CONFIG" $(ssh_opts) -t "$name" "$@"
+}
+
+cmd_agent() {
+  # Start a coding agent in the shared workspace, attached to your terminal.
+  local name=${1:?usage: agentbox agent <name> [claude args...]}; shift || true
+  load_box "$name"
+  box_running "$BOX_DIR" || die "box '$name' is not running -- agentbox up $name"
+  local q=""; local a
+  for a in "$@"; do q+=" $(printf '%q' "$a")"; done
+  # shellcheck disable=SC2086
+  exec ssh -F "$SSH_CONFIG" $(ssh_opts) -t "$name" \
+      "cd ~/workspace && exec claude$q"
+}
+
+cmd_code() {
+  local name=${1:?usage: agentbox code <name>}
+  load_box "$name"
+  box_running "$BOX_DIR" || die "box '$name' is not running -- agentbox up $name"
+  grep -qs "Include $SSH_CONFIG" "$HOME/.ssh/config" \
+    || die "VS Code reads ~/.ssh/config -- run: agentbox ssh-config --install"
+  command -v code >/dev/null || die "the 'code' command is not on PATH"
+  log "opening VS Code on $name:/home/agent/workspace"
+  code --remote "ssh-remote+$name" /home/agent/workspace
+}
+
+cmd_logs() {
+  load_box "${1:?usage: agentbox logs <name>}"
+  [[ ${2-} == -f ]] && exec tail -f "$BOX_DIR/run/console.log"
+  tail -n 200 "$BOX_DIR/run/console.log"
+}
+
+# ============================================================= destroy ======
+cmd_destroy() {
+  local name=${1:?usage: agentbox destroy <name> [--keep-workspace]} keep=0
+  [[ ${2-} == --keep-workspace ]] && keep=1
+  load_box "$name"
+  local internal=0
+  [[ $BOX_WORKSPACE == "$BOX_DIR/workspace" ]] && internal=1
+
+  printf 'Destroy box %s?\n' "$name" >&2
+  printf '  deletes: VM disk, ssh key, cloud-init seed\n' >&2
+  if (( internal && !keep )); then
+    printf '  %sdeletes: %s (this box owns its workspace -- nothing else has a copy)%s\n' \
+      "$C_YEL" "$BOX_WORKSPACE" "$C_OFF" >&2
+  else
+    printf '  keeps:   %s\n' "$BOX_WORKSPACE" >&2
+  fi
+  read -r -p "Type the box name to confirm: " reply
+  [[ $reply == "$name" ]] || die "aborted"
+
+  box_running "$BOX_DIR" && cmd_down "$name"
+  if (( internal && !keep )); then
+    rm -rf "$BOX_DIR"
+  else
+    # Never remove a workspace the user pointed us at from elsewhere.
+    find "$BOX_DIR" -mindepth 1 -maxdepth 1 ! -name workspace -exec rm -rf {} +
+    [[ $internal == 0 ]] && rm -rf "$BOX_DIR"
+  fi
+  regen_ssh_config
+  net_is_up && net_apply
+  ok "box '$name' destroyed"
+}
+
+# ========================================================= rebuild box ======
+cmd_reset() {
+  # Throw away the VM's own filesystem, keep the workspace and identity.
+  local name=${1:?usage: agentbox reset <name>}
+  load_box "$name"
+  printf 'Reset %s to a clean base image? The workspace at %s is untouched.\n' "$name" "$BOX_WORKSPACE" >&2
+  read -r -p "Type yes to confirm: " reply; [[ $reply == yes ]] || die "aborted"
+  box_running "$BOX_DIR" && cmd_down "$name"
+  rm -f "$BOX_DIR/disk.qcow2"
+  qemu-img create -f qcow2 -F qcow2 -b "$BASE_IMAGE" "$BOX_DIR/disk.qcow2" >/dev/null
+  build_seed "$name"
+  ok "box '$name' reset -- agentbox up $name"
+}
+
+# ============================================================== reseed ======
+cmd_reseed() {
+  # Rebuild the cloud-init seed after editing box.conf (network mode, egress,
+  # hostname). The VM disk and workspace are untouched.
+  local name=${1:?usage: agentbox reseed <name>}
+  load_box "$name"
+  box_running "$BOX_DIR" && warn "changes apply after: agentbox down $name && agentbox up $name"
+  build_seed "$name"
+  regen_ssh_config
+  net_is_up && net_apply
+  ok "seed rebuilt for '$name'"
+}
+
+# =============================================================== allow ======
+bundle_file() { printf '%s/etc/allow.d/%s.txt' "$AGENTBOX_ROOT" "$1"; }
+
+list_bundles() {
+  local f
+  printf 'egress bundles (agentbox allow <box> --bundle NAME):\n'
+  for f in "$AGENTBOX_ROOT"/etc/allow.d/*.txt; do
+    [[ -f $f ]] || continue
+    printf '  %-10s %2s hosts   %s\n' "$(basename "$f" .txt)" \
+      "$(grep -cvE '^\s*(#|$)' "$f")" "$(sed -n '1s/^# *//p' "$f")"
+  done
+}
+
+apply_bundle() {
+  # apply_bundle <box_dir> <name> -- append a bundle's hosts, skipping dupes.
+  local bd=$1 name=$2 bf; bf=$(bundle_file "$name")
+  [[ -f $bf ]] || die "no such bundle: $name  (agentbox allow --list)"
+  local added=0 h
+  while read -r h; do
+    h=${h%%#*}; h=${h// /}
+    [[ -z $h ]] && continue
+    grep -qxF "$h" "$bd/allow.txt" || { echo "$h" >> "$bd/allow.txt"; added=$((added+1)); }
+  done < "$bf"
+  ok "bundle '$name': $added host(s) added"
+}
+
+cmd_allow() {
+  if [[ ${1-} == --list || ${1-} == --list-bundles ]]; then list_bundles; return 0; fi
+  local name=${1:?usage: agentbox allow <name> <domain>... | --bundle NAME | --list}; shift
+  [[ $# -gt 0 ]] || die "usage: agentbox allow <name> <domain>... | --bundle NAME"
+  load_box "$name"
+  case $BOX_EGRESS in
+    allow|proxy) ;;
+    *) warn "box '$name' egress is '$BOX_EGRESS'; the allowlist is inert until it is 'allow' or 'proxy'" ;;
+  esac
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --bundle) apply_bundle "$BOX_DIR" "$2"; shift 2 ;;
+      -*) die "allow: unknown option $1" ;;
+      *) grep -qxF "$1" "$BOX_DIR/allow.txt" || echo "$1" >> "$BOX_DIR/allow.txt"
+         ok "allowed $1"; shift ;;
+    esac
+  done
+  # The proxy reloads allow.txt on change by itself; nftables needs a nudge.
+  net_is_up && net_apply
+}
+
+# =========================================================== egress-log =====
+cmd_egress_log() {
+  local name=${1:?usage: agentbox egress-log <name> [n]}
+  load_box "$name"
+  printf 'egress audit for %s (policy: %s)\n\n' "$name" "$BOX_EGRESS" >&2
+  egress_log_summary "$BOX_DIR" "${2:-40}"
+}
+
+# ========================================================== ssh-config ======
+cmd_ssh_config() {
+  regen_ssh_config
+  if [[ ${1-} == --install ]]; then
+    mkdir -p "$HOME/.ssh"; touch "$HOME/.ssh/config"; chmod 600 "$HOME/.ssh/config"
+    if grep -qs "Include $SSH_CONFIG" "$HOME/.ssh/config"; then
+      ok "already installed"
+    else
+      # Include has to precede any Host block to apply to all of them.
+      printf 'Include %s\n\n%s' "$SSH_CONFIG" "$(cat "$HOME/.ssh/config")" > "$HOME/.ssh/config.new"
+      mv "$HOME/.ssh/config.new" "$HOME/.ssh/config"; chmod 600 "$HOME/.ssh/config"
+      ok "added 'Include $SSH_CONFIG' to ~/.ssh/config"
+    fi
+  else
+    cat "$SSH_CONFIG"
+    dim "run 'agentbox ssh-config --install' to wire this into ~/.ssh/config"
+  fi
+}
+
+# ================================================================= net ======
+cmd_net() {
+  case ${1:-status} in
+    up)      net_up ;;
+    down)    net_down ;;
+    status)  net_status ;;
+    refresh) net_apply; ok "egress allowlists refreshed" ;;
+    *) die "usage: agentbox net {up|down|status|refresh}" ;;
+  esac
+}
+
+# ================================================================ help ======
+usage() {
+cat <<'EOF'
+agentbox -- one disposable KVM microVM per project, for coding agents.
+
+  doctor                         check host prerequisites
+  build [--release 24.04] [-f]   build the shared base image (once, ~10 min)
+  image <subcommand>             edit the base image without a full rebuild
+      list | history | layers    what is in it, what changed it, how it is built
+      install <pkg>... | remove <pkg>...
+      run <script.sh> | exec <shell command>
+      rollback [n]               revert to a previous base image
+
+  create <name> [options]        define a box
+      --workspace DIR            host dir shared into the VM at ~/workspace
+      --cpus N  --mem MB  --disk GB
+      --net slirp|bridge         slirp needs no privileges; bridge is filtered
+      --egress open|allow|proxy|none
+                                 open: NAT. allow: nftables IP set. proxy:
+                                 domain-filtered via host proxy, audited, no
+                                 DNS egress. none: no egress at all.
+      --vpn IFACE                route this box out IFACE (e.g. a wireguard
+                                 tunnel) with a fail-closed kill switch
+      --port HOST:GUEST          publish a guest port (slirp mode)
+      --allow BUNDLE             add an egress bundle (agentbox allow --list)
+      --creds share|none         share: copy the host Claude token in (default,
+                                 convenient, and the box can then act as you).
+                                 none: log in separately inside the box.
+  up <name>                      boot it
+  down <name>                    shut it down
+  reset <name>                   wipe the VM disk, keep the workspace
+  reseed <name>                  rebuild the cloud-init seed after editing box.conf
+  destroy <name> [--keep-workspace]
+
+  ls                             list boxes
+  status <name>                  detail for one box
+  logs <name> [-f]               serial console
+
+  ssh <name> [-- cmd...]         shell in as `agent`
+  agent <name> [args...]         run claude in ~/workspace
+  code <name>                    open VS Code Remote-SSH on the workspace
+  ssh-config [--install]         wire box names into ~/.ssh/config
+
+  creds <name> push|clear|status what credentials the box holds  [--also PATH]
+  allow <name> <domain>...       add to a box's egress allowlist
+  allow <name> --bundle NAME     add a whole ecosystem (python, node, rust, go...)
+  allow --list                   show the available egress bundles
+  egress-log <name> [n]          what the box tried to reach, and what was denied
+  net up|down|status|refresh     host bridge + NAT + nftables policy (sudo)
+
+State lives in $AGENTBOX_HOME (default ~/.agentbox).
+EOF
+}
+
+# =============================================================== main =======
+main() {
+  local cmd=${1:-help}; shift || true
+  case $cmd in
+    doctor)      cmd_doctor "$@" ;;
+    build)       cmd_build "$@" ;;
+    create)      cmd_create "$@" ;;
+    up|start)    cmd_up "$@" ;;
+    down|stop)   cmd_down "$@" ;;
+    reset)       cmd_reset "$@" ;;
+    reseed)      cmd_reseed "$@" ;;
+    destroy|rm)  cmd_destroy "$@" ;;
+    ls|list)     cmd_ls "$@" ;;
+    status)      cmd_status "$@" ;;
+    logs)        cmd_logs "$@" ;;
+    ssh)         cmd_ssh "$@" ;;
+    agent)       cmd_agent "$@" ;;
+    code)        cmd_code "$@" ;;
+    ssh-config)  cmd_ssh_config "$@" ;;
+    allow)       cmd_allow "$@" ;;
+    creds)       cmd_creds "$@" ;;
+    egress-log)  cmd_egress_log "$@" ;;
+    net)         cmd_net "$@" ;;
+    image)       cmd_image "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

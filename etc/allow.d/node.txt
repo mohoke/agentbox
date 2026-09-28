@@ -1,0 +1,4 @@
+# Node: npm registry and the Node distribution host.
+registry.npmjs.org
+nodejs.org
+deb.nodesource.com

@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""Domain-filtering egress proxy for agentbox VMs.
+
+Why this exists: the nftables allowlist in lib/net.sh matches resolved IP
+addresses, which is porous for anything CDN-hosted -- allowing github.com also
+allows every other site sharing those Fastly addresses. This proxy filters on
+the hostname the guest actually asks for, which is the control that GitHub's
+Copilot firewall and Anthropic's devcontainer firewall both use.
+
+It speaks just enough HTTP to be a proxy:
+  * CONNECT host:port            -- TLS tunnelling, the common case
+  * GET/POST http://host/path    -- absolute-form requests, used by apt
+
+Every decision is written to a JSONL audit log, which doubles as the egress
+record for a box: what it tried to reach, when, and whether it got there.
+
+    agentbox-egress-proxy --allow-file allow.txt --log egress.jsonl \
+                          --listen 10.77.0.1 --port 8118
+
+Allow-file syntax (one per line, '#' comments):
+    github.com          matches github.com and any subdomain
+    .githubusercontent.com  leading dot is equivalent
+    *.pypi.org          glob form, also accepted
+Matching is on the hostname only. A rule never widens to a different
+registrable domain: "api.github.com" does not match "github.com.evil.net".
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import select
+import socket
+import socketserver
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+
+BUFSIZE = 65536
+CONNECT_TIMEOUT = 15
+IDLE_TIMEOUT = 300
+ALLOWED_PORTS = {80, 443}
+
+
+class Policy:
+    """Hostname allowlist, reloaded when the file changes on disk."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._rules: set[str] = set()
+        self._mtime = 0.0
+        self._lock = threading.Lock()
+        self.reload()
+
+    def reload(self) -> None:
+        try:
+            mtime = os.path.getmtime(self.path)
+        except OSError:
+            return
+        if mtime == self._mtime:
+            return
+        rules = set()
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.split("#", 1)[0].strip().lower()
+                    if not line:
+                        continue
+                    if line.startswith("*."):
+                        line = line[1:]          # "*.x.com" -> ".x.com"
+                    rules.add(line)
+        except OSError:
+            return
+        with self._lock:
+            self._rules, self._mtime = rules, mtime
+
+    def allows(self, host: str) -> bool:
+        host = host.lower().rstrip(".")
+        # Strip any userinfo/port that slipped through.
+        if "@" in host:
+            host = host.rsplit("@", 1)[1]
+        with self._lock:
+            rules = self._rules
+        for rule in rules:
+            if rule.startswith("."):
+                # ".example.com" matches example.com and *.example.com
+                base = rule[1:]
+                if host == base or host.endswith(rule):
+                    return True
+            elif host == rule or host.endswith("." + rule):
+                return True
+        return False
+
+
+class Audit:
+    """JSONL egress log. One line per decision, flushed immediately."""
+
+    def __init__(self, path: str | None):
+        self.path = path
+        self._lock = threading.Lock()
+
+    def write(self, **fields) -> None:
+        fields["ts"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        line = json.dumps(fields, separators=(",", ":"))
+        if not self.path:
+            print(line, flush=True)
+            return
+        with self._lock:
+            try:
+                with open(self.path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
+
+
+def pump(a: socket.socket, b: socket.socket) -> tuple[int, int]:
+    """Bidirectional relay until either side closes or goes idle."""
+    up = down = 0
+    socks = [a, b]
+    try:
+        while True:
+            r, _, x = select.select(socks, [], socks, IDLE_TIMEOUT)
+            if x or not r:
+                break
+            for s in r:
+                try:
+                    data = s.recv(BUFSIZE)
+                except OSError:
+                    return up, down
+                if not data:
+                    return up, down
+                other = b if s is a else a
+                try:
+                    other.sendall(data)
+                except OSError:
+                    return up, down
+                if s is a:
+                    up += len(data)
+                else:
+                    down += len(data)
+    except (OSError, ValueError):
+        pass
+    return up, down
+
+
+class Handler(socketserver.StreamRequestHandler):
+    timeout = 60
+    policy: Policy
+    audit: Audit
+
+    def _deny(self, host: str, port: int, reason: str, method: str) -> None:
+        self.audit.write(event="deny", client=self.client_address[0],
+                         host=host, port=port, method=method, reason=reason)
+        body = (f"agentbox egress policy denied {host}:{port}\n"
+                f"Reason: {reason}\n"
+                f"If this host is legitimately needed, add it on the HOST with:\n"
+                f"    agentbox allow <box> {host}\n").encode()
+        try:
+            self.wfile.write(
+                b"HTTP/1.1 403 Forbidden\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Proxy-Connection: close\r\n\r\n" + body)
+        except OSError:
+            pass
+
+    def handle(self) -> None:
+        self.policy.reload()
+        try:
+            request_line = self.rfile.readline(65536).decode("latin-1").strip()
+        except (OSError, UnicodeDecodeError):
+            return
+        if not request_line:
+            return
+        parts = request_line.split()
+        if len(parts) < 3:
+            return
+        method, target = parts[0].upper(), parts[1]
+
+        if method == "CONNECT":
+            host, _, port_s = target.rpartition(":")
+            try:
+                port = int(port_s)
+            except ValueError:
+                return
+            self._connect(host, port)
+        elif target.startswith("http://"):
+            rest = target[len("http://"):]
+            hostport = rest.split("/", 1)[0]
+            host, _, port_s = hostport.partition(":")
+            port = int(port_s) if port_s.isdigit() else 80
+            self._plain(host, port, request_line)
+        else:
+            # Relative-form request: the client is treating us as an origin
+            # server, which means it was not configured to use a proxy.
+            self._deny(target, 0, "non-proxy request", method)
+
+    def _check(self, host: str, port: int, method: str) -> bool:
+        if port not in ALLOWED_PORTS:
+            self._deny(host, port, f"port {port} not permitted", method)
+            return False
+        if not self.policy.allows(host):
+            self._deny(host, port, "host not in allowlist", method)
+            return False
+        return True
+
+    def _open_upstream(self, host: str, port: int, method: str) -> socket.socket | None:
+        try:
+            up = socket.create_connection((host, port), CONNECT_TIMEOUT)
+            up.settimeout(None)
+            return up
+        except OSError as exc:
+            self.audit.write(event="error", client=self.client_address[0],
+                             host=host, port=port, method=method, reason=str(exc)[:120])
+            try:
+                self.wfile.write(b"HTTP/1.1 502 Bad Gateway\r\n"
+                                 b"Content-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+            return None
+
+    def _connect(self, host: str, port: int) -> None:
+        if not self._check(host, port, "CONNECT"):
+            return
+        up = self._open_upstream(host, port, "CONNECT")
+        if up is None:
+            return
+        started = time.time()
+        try:
+            self.wfile.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            self.wfile.flush()
+        except OSError:
+            up.close(); return
+        sent, recv = pump(self.connection, up)
+        up.close()
+        self.audit.write(event="allow", client=self.client_address[0], host=host,
+                         port=port, method="CONNECT", bytes_up=sent, bytes_down=recv,
+                         seconds=round(time.time() - started, 1))
+
+    def _plain(self, host: str, port: int, request_line: str) -> None:
+        method = request_line.split()[0]
+        if not self._check(host, port, method):
+            return
+        headers = []
+        while True:
+            try:
+                line = self.rfile.readline(65536)
+            except OSError:
+                return
+            if not line or line in (b"\r\n", b"\n"):
+                break
+            if not line.lower().startswith(b"proxy-"):
+                headers.append(line)
+        up = self._open_upstream(host, port, method)
+        if up is None:
+            return
+        # Rewrite absolute-form to origin-form for the upstream server.
+        path = request_line.split()[1].split("/", 3)
+        origin = "/" + (path[3] if len(path) > 3 else "")
+        head = f"{method} {origin} {request_line.split()[2]}\r\n".encode("latin-1")
+        try:
+            up.sendall(head + b"".join(headers) + b"\r\n")
+        except OSError:
+            up.close(); return
+        sent, recv = pump(self.connection, up)
+        up.close()
+        self.audit.write(event="allow", client=self.client_address[0], host=host,
+                         port=port, method=method, bytes_up=sent, bytes_down=recv)
+
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="agentbox domain-filtering egress proxy")
+    ap.add_argument("--allow-file", required=True)
+    ap.add_argument("--listen", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8118)
+    ap.add_argument("--log", default=None, help="JSONL audit log (default: stdout)")
+    a = ap.parse_args()
+
+    Handler.policy = Policy(a.allow_file)
+    Handler.audit = Audit(a.log)
+    Handler.audit.write(event="start", listen=f"{a.listen}:{a.port}",
+                        allow_file=a.allow_file,
+                        rules=len(Handler.policy._rules))
+    srv = Server((a.listen, a.port), Handler)
+    try:
+        srv.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

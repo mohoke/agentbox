@@ -1,0 +1,6 @@
+# Go: module proxy, checksum database, and the toolchain host.
+proxy.golang.org
+sum.golang.org
+go.dev
+golang.org
+storage.googleapis.com

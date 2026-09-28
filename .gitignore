@@ -1,0 +1,12 @@
+# Nothing here should ever be committed: all of it is generated, huge, or local.
+*.qcow2
+*.img
+*.iso
+*.log
+*.pid
+*.sock
+
+# Runtime state lives in ~/.agentbox, but guard against a stray copy.
+boxes/
+images/
+cache/

@@ -1,0 +1,6 @@
+# GitHub: clone, API, releases and raw content.
+github.com
+api.github.com
+codeload.github.com
+objects.githubusercontent.com
+raw.githubusercontent.com
