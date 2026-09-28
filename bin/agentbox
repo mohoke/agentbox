@@ -379,7 +379,9 @@ cmd_up() {
       vpn_route_apply "$BOX_IP" "$BOX_INDEX" "$BOX_UPLINK"
     fi
     [[ $BOX_EGRESS == proxy ]] && proxy_start "$BOX_DIR" "$BOX_INDEX"
-    net_apply                           # refresh this box's allowlist set
+    # Refuse to start a bridge box whose policy could not be loaded: it would
+    # otherwise run with whatever rules happened to be in place.
+    net_apply || die "refusing to start '$BOX_NAME' without its egress policy"
     netdev="tap,id=n0,ifname=ag$BOX_INDEX,script=no,downscript=no"
   else
     netdev="user,id=n0,hostfwd=tcp:127.0.0.1:$BOX_SSH_PORT-:22"
@@ -557,7 +559,7 @@ cmd_destroy() {
     [[ $internal == 0 ]] && rm -rf "$BOX_DIR"
   fi
   regen_ssh_config
-  net_is_up && net_apply
+  net_is_up && net_apply || true
   ok "box '$name' destroyed"
 }
 
@@ -584,7 +586,7 @@ cmd_reseed() {
   box_running "$BOX_DIR" && warn "changes apply after: agentbox down $name && agentbox up $name"
   build_seed "$name"
   regen_ssh_config
-  net_is_up && net_apply
+  net_is_up && net_apply || true
   ok "seed rebuilt for '$name'"
 }
 
@@ -632,7 +634,7 @@ cmd_allow() {
     esac
   done
   # The proxy reloads allow.txt on change by itself; nftables needs a nudge.
-  net_is_up && net_apply
+  net_is_up && net_apply || true
 }
 
 # =========================================================== egress-log =====
@@ -668,7 +670,7 @@ cmd_net() {
     up)      net_up ;;
     down)    net_down ;;
     status)  net_status ;;
-    refresh) net_apply; ok "egress allowlists refreshed" ;;
+    refresh) net_apply && ok "egress allowlists refreshed" ;;
     *) die "usage: agentbox net {up|down|status|refresh}" ;;
   esac
 }

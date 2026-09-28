@@ -15,6 +15,11 @@ DNSMASQ_PID="$AGENTBOX_HOME/run/dnsmasq.pid"
 
 uplink_iface() { ip -j route show default | jq -r '.[0].dev // empty'; }
 
+# Can we run a privileged command without prompting? Once the bridge is up,
+# every create/destroy/allow wants to refresh the policy, and a password prompt
+# in the middle of an unrelated command is worse than a clear warning.
+sudo_ok() { sudo -n true 2>/dev/null; }
+
 net_is_up() { ip link show "$AGENTBOX_BRIDGE" >/dev/null 2>&1; }
 
 require_net_up() {
@@ -45,7 +50,7 @@ net_up() {
       || warn "dnsmasq failed to start; guests will have no DNS"
   fi
 
-  net_apply
+  net_apply || die "could not load the nftables policy; the bridge is up but unfiltered"
   ok "network up (bridge=$AGENTBOX_BRIDGE uplink=$up)"
 }
 
@@ -171,8 +176,21 @@ net_apply() {
     echo "}"
   } > "$rules"
 
+  if ! sudo_ok; then
+    rm -f "$rules"
+    warn "cannot refresh the nftables policy: sudo needs a password"
+    dim  "    the policy already loaded is still in force; to pick up this change:"
+    dim  "        sudo -v && agentbox net refresh"
+    return 1
+  fi
+
   sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
-  sudo nft -f "$rules" || { cat "$rules" >&2; rm -f "$rules"; die "nft ruleset rejected"; }
+  if ! sudo nft -f "$rules"; then
+    cat "$rules" >&2
+    rm -f "$rules"
+    warn "nftables rejected the generated ruleset (printed above)"
+    return 1
+  fi
   rm -f "$rules"
 }
 
