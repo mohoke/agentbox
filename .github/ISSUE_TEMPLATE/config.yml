@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability (do not open a public issue)
+    url: https://github.com/OWNER/REPO/security/advisories/new
+    about: >-
+      Anything that escapes the egress policy, reaches the host or LAN from a
+      guest, or leaks credentials. Report it privately. See SECURITY.md.

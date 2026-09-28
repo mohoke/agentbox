@@ -1,0 +1,106 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static:
+    name: shell syntax and shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n every script
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            if bash -n "$f"; then echo "ok   $f"; else echo "FAIL $f"; fail=1; fi
+          done < <(git ls-files '*.sh' 'bin/agentbox')
+          exit $fail
+
+      - name: python syntax
+        run: |
+          python3 -m py_compile bin/agentbox-egress-proxy
+          echo "ok   bin/agentbox-egress-proxy"
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # Informational for now: the codebase is not shellcheck-clean yet.
+          # Tighten to a hard failure once the existing findings are cleared.
+          shellcheck -S warning bin/agentbox lib/*.sh test/*.sh || true
+
+  policy:
+    name: firewall policy and egress proxy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq nftables dnsmasq curl
+
+      # Renders the nftables ruleset with sudo/ip/getent stubbed and asserts the
+      # security-relevant rules. Needs no root and no network.
+      - name: nftables policy
+        run: ./test/net-rules.sh
+
+      # Runs the real proxy on loopback and checks allowlist matching, including
+      # the suffix-confusion cases. Reaches the internet for the allowed hosts.
+      - name: egress proxy
+        run: ./test/egress-proxy.sh
+
+  vm:
+    name: end-to-end (KVM)
+    runs-on: ubuntu-latest
+    # The full suite builds a base image, which takes ~15 minutes and several
+    # gigabytes. Run it on demand and on main, not on every pull request.
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check for KVM
+        id: kvm
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm || true
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "KVM present"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::no /dev/kvm on this runner; skipping the end-to-end suite"
+          fi
+
+      - name: install dependencies
+        if: steps.kvm.outputs.available == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils virtiofsd \
+                                      xorriso jq nftables dnsmasq
+
+      - name: doctor
+        if: steps.kvm.outputs.available == 'true'
+        run: ./bin/agentbox doctor
+
+      - name: build the base image
+        if: steps.kvm.outputs.available == 'true'
+        run: ./bin/agentbox build
+
+      - name: end-to-end smoke test
+        if: steps.kvm.outputs.available == 'true'
+        # No host credentials exist on a runner, so boxes must work without them.
+        env:
+          AGENTBOX_CREDS: none
+        run: ./test/smoke.sh
+
+      - name: serial console on failure
+        if: failure() && steps.kvm.outputs.available == 'true'
+        run: |
+          tail -n 200 ~/.agentbox/images/build-console.log 2>/dev/null || true
+          for f in ~/.agentbox/boxes/*/run/console.log; do
+            [ -e "$f" ] || continue
+            echo "=== $f ==="; tail -n 100 "$f"
+          done
