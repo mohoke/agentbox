@@ -29,15 +29,15 @@ sudo usermod -aG kvm "$USER"   # log out and back in
 
 ## Running the tests
 
-Three suites, two of which need nothing special:
+Four suites. Three need nothing special:
 
 ```sh
-./test/net-rules.sh      # 25 assertions on the generated nftables policy, offline
+./test/net-rules.sh      # 33 assertions on the generated nftables policy, offline
 ./test/egress-proxy.sh   # 14 checks on domain filtering, loopback only
 ./test/smoke.sh          # boots a real VM, 21 checks, ~2 min (needs KVM)
 ```
 
-A fourth needs root and a live bridge, because it puts real packets through the
+The fourth needs root and a live bridge, because it puts real packets through the
 kernel's copy of the policy:
 
 ```sh

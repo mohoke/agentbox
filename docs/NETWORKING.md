@@ -63,9 +63,12 @@ is first-match.
 ```
 1  ct state established,related accept   return traffic for host-initiated flows
 2  <per-box rules>                       proxy-mode boxes: proxy port, then drop
-3  dport 53 accept                       the resolver, for every other box
-4  icmp echo-request accept              ping
-5  drop                                  everything else the host runs
+3  udp dport 53 accept                   the resolver, for every other box
+4  tcp dport 53 accept                   (protocol-qualified: the combined
+                                          `meta l4proto {tcp,udp} th dport 53`
+                                          form loads but does not match)
+5  icmp echo-request accept              ping
+6  drop                                  everything else the host runs
 ```
 
 Rule 1 must come first: you open SSH *to* the guest, so its replies arrive as an
@@ -74,7 +77,7 @@ never become reachable. A *new* DNS query is `ct state NEW`, so it falls past
 rule 1 into a proxy box's drop — which is how proxy mode removes DNS without
 breaking SSH.
 
-Rule 5 is why a box cannot reach a database, dev server or SSH daemon you happen
+Rule 6 is why a box cannot reach a database, dev server or SSH daemon you happen
 to be running on the host.
 
 **`forward`** — what a guest may send anywhere else.
