@@ -72,7 +72,7 @@ falsify one of these, that is the bug report we most want.**
 | C1 | An agent cannot read or write host files outside the shared workspace. | `smoke.sh` |
 | C2 | An agent cannot reach services on the host (ssh, databases, dev servers). | `net-rules.sh`, `bridge-live.sh` |
 | C3 | An agent cannot reach your LAN or other machines on it. | `net-rules.sh`, `bridge-live.sh` |
-| C4 | One box cannot reach another box. | `net-rules.sh`, `bridge-live.sh` |
+| C4 | One box cannot reach another box. Enforced by bridge **port isolation** at layer 2, not by the nftables forward chain -- switched frames never reach that chain unless `br_netfilter` is loaded and `bridge-nf-call-iptables` is 1, neither of which agentbox controls. A live test caught this claim being false when that sysctl was 0. | `bridge-live.sh` (asserts the port flag and tests real traffic) |
 | C5 | With `--egress proxy`, only allowlisted **hostnames** are reachable, and hostname matching is not defeatable by suffix or prefix confusion. | `egress-proxy.sh` |
 | C6 | With `--egress proxy`, the guest has no DNS route, so DNS tunnelling is unavailable. | `bridge-live.sh` |
 | C7 | With `--egress none`, no egress is possible. | `net-rules.sh` |

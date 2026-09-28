@@ -726,9 +726,59 @@ cmd_netdiag() {
   # Piped over ssh rather than quoted inline: nesting a diagnostic script
   # through ssh argument quoting is a reliable way to corrupt it.
   # shellcheck disable=SC2086
-  ssh -F "$SSH_CONFIG" $(ssh_opts) -o BatchMode=yes "$name" \
-      "bash -s -- ${AGENTBOX_DNS}" < "$AGENTBOX_ROOT/libexec/netdiag-guest.sh" \
-    || warn "could not run the guest diagnostic"
+  if ssh -F "$SSH_CONFIG" $(ssh_opts) -o BatchMode=yes -o ConnectTimeout=8 "$name" \
+        "bash -s -- ${AGENTBOX_DNS}" < "$AGENTBOX_ROOT/libexec/netdiag-guest.sh"; then
+    return 0
+  fi
+
+  # ssh is the usual casualty of exactly the failures this command exists to
+  # diagnose, so fall back to the serial console, which needs no network.
+  warn "ssh did not answer; falling back to the serial console"
+  [[ -S $BOX_DIR/run/console.sock ]] || {
+    warn "no console socket either -- restart the box to get one:"
+    dim  "    agentbox down $name && agentbox up $name"
+    return 1
+  }
+  python3 - "$BOX_DIR/run/console.sock" "$AGENTBOX_ROOT/libexec/netdiag-guest.sh" \
+           "$AGENTBOX_DNS" <<'PY'
+import socket, sys, time
+sock, script, dns = sys.argv[1], sys.argv[2], sys.argv[3]
+body = open(script, encoding="utf-8").read()
+s = socket.socket(socket.AF_UNIX); s.connect(sock); s.settimeout(3)
+s.sendall(b"\r"); time.sleep(1)
+try:
+    s.recv(65536)
+except socket.timeout:
+    pass
+# Ship the script in as a heredoc rather than pasting commands one by one:
+# a console is a tty, and line-by-line paste races with the shell's echo.
+s.sendall(b"cat > /tmp/nd.sh <<'AGENTBOX_EOF'\r")
+for line in body.splitlines():
+    s.sendall(line.encode() + b"\r")
+    time.sleep(0.004)
+s.sendall(b"AGENTBOX_EOF\r")
+time.sleep(1)
+s.sendall(f"bash /tmp/nd.sh {dns}; echo __ND_DONE__\r".encode())
+buf = b""
+deadline = time.time() + 60
+while time.time() < deadline:
+    try:
+        d = s.recv(8192)
+    except socket.timeout:
+        continue
+    if not d:
+        break
+    buf += d
+    if b"__ND_DONE__" in buf.replace(b"echo __ND_DONE__", b""):
+        break
+text = buf.decode(errors="replace")
+started = False
+for line in text.splitlines():
+    if line.startswith("guest:"):
+        started = True
+    if started and "__ND_DONE__" not in line and "nd.sh" not in line:
+        print(line.rstrip())
+PY
 }
 
 # =========================================================== egress-log =====

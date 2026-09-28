@@ -87,10 +87,31 @@ net_down() {
 tap_up() {
   # tap_up <index> -- a persistent tap the unprivileged qemu can open by name.
   local dev="ag$1"
-  ip link show "$dev" >/dev/null 2>&1 && return 0
-  sudo ip tuntap add dev "$dev" mode tap user "$USER"
-  sudo ip link set "$dev" master "$AGENTBOX_BRIDGE"
-  sudo ip link set "$dev" up
+  if ! ip link show "$dev" >/dev/null 2>&1; then
+    sudo ip tuntap add dev "$dev" mode tap user "$USER"
+    sudo ip link set "$dev" master "$AGENTBOX_BRIDGE"
+    sudo ip link set "$dev" up
+  fi
+  # Enforce box-to-box isolation at layer 2, where the traffic actually is.
+  #
+  # Frames between two boxes on this bridge are switched, not routed, so they
+  # never reach the ip forward chain -- the `oifname agbr0 drop` rule there only
+  # sees them when br_netfilter happens to be loaded AND
+  # net.bridge.bridge-nf-call-iptables is 1. Neither is under our control: the
+  # module loads on demand and any admin, VPN client or container runtime can
+  # flip the sysctl. Relying on it meant isolation could disappear silently,
+  # which a live test caught: box B reached box A's ssh with the sysctl at 0.
+  #
+  # An isolated bridge port may talk to non-isolated ports (the bridge itself,
+  # so the host and its resolver stay reachable) but never to another isolated
+  # port. That is precisely the property claimed, enforced by the bridge.
+  sudo bridge link set dev "$dev" isolated on \
+    || warn "could not set port isolation on $dev -- boxes may reach each other"
+}
+
+tap_isolated() {
+  # tap_isolated <index> -- true when the port is actually isolated.
+  bridge -d link show dev "ag$1" 2>/dev/null | grep -q 'isolated on'
 }
 
 tap_down() { sudo ip link del "ag$1" 2>/dev/null || true; }
@@ -166,11 +187,11 @@ net_apply() {
         [[ $BOX_NET == bridge ]] || exit 0
         egress_input_rules "$BOX_EGRESS" "$BOX_IP" "$BOX_INDEX" )
     done
-    # Two explicit rules rather than `meta l4proto { tcp, udp } th dport 53`.
-    # That combined form loads without complaint but does not match here, so
-    # DNS fell through to the chain's drop and no bridge box could resolve --
-    # while ICMP, matched by the next rule, still worked and made the network
-    # look half-alive. Protocol-qualified matches are unambiguous.
+    # Two protocol-qualified rules rather than the equivalent
+    # `meta l4proto { tcp, udp } th dport 53`. Both forms work -- an A/B test
+    # (test/ab-dns-rule.sh) confirmed it after an earlier commit wrongly blamed
+    # the combined form for a DNS outage that was really a VPN blocking this
+    # subnet. This spelling is kept purely because it is easier to read.
     echo "    iifname \"$AGENTBOX_BRIDGE\" udp dport 53 accept"
     echo "    iifname \"$AGENTBOX_BRIDGE\" tcp dport 53 accept"
     echo "    iifname \"$AGENTBOX_BRIDGE\" icmp type echo-request accept"

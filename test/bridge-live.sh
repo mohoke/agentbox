@@ -78,6 +78,14 @@ else
 fi
 
 echo "# isolation invariants"
+for n in "$A" "$B"; do
+  idx=$(sed -n 's/^BOX_INDEX=//p' "$HOME/.agentbox/boxes/$n/box.conf")
+  if bridge -d link show dev "ag$idx" 2>/dev/null | grep -q 'isolated on'; then
+    ok_ "bridge port ag$idx is isolated"
+  else
+    bad_ "bridge port ag$idx is NOT isolated" "box-to-box relies on this"
+  fi
+done
 if inbox "$B" "timeout 5 bash -c '</dev/tcp/$IP_A/22'"; then
   bad_ "box B reached box A's ssh" "box-to-box traffic is not blocked"
 else

@@ -175,6 +175,31 @@ change in `lib/egress.sh` — remove the per-box `drop` for UDP/TCP 53 in
 because DNS is a working exfiltration channel and proxy mode exists to close
 channels. Know what you are turning back on.
 
+## VPN clients block the bridge subnet
+
+This is the single most likely reason a freshly built bridge setup does not
+work, and it produces symptoms that look like a firewall bug in agentbox:
+correct addresses on both sides, correct routes, ARP resolving, and no traffic.
+
+A VPN client with its own firewall will drop traffic to and from
+`10.77.0.0/24` because that subnet is not part of the tunnel and not in its
+allowlist. NordVPN, for example, needs:
+
+```sh
+nordvpn allowlist add subnet 10.77.0.0/24
+```
+
+Other clients have an equivalent — a split-tunnel or "local network" exception.
+The tell is that `agentbox netdiag` reports every host-side component healthy
+(bridge up, dnsmasq running, policy loaded) while the guest can reach nothing,
+and `sudo nft list table inet agentbox` shows rules that plainly permit the
+traffic. If the policy says allow and packets still vanish, something outside
+that table is dropping them.
+
+Note that VPN clients also reset `net.ipv4.ip_forward` to 0 on connect, which
+breaks egress for every bridge box independently of the above. `agentbox net up`
+and `agentbox net refresh` both restore it.
+
 ## Troubleshooting
 
 **A bridge box has no DNS.** Check the resolver is up and answering:
