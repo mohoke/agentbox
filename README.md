@@ -271,6 +271,7 @@ State lives in `~/.agentbox`: `images/base.qcow2` (shared, read-only),
 | | |
 | --- | --- |
 | [docs/DESIGN.md](docs/DESIGN.md) | Why it is built this way; QEMU vs Firecracker vs containers |
+| [docs/NETWORKING.md](docs/NETWORKING.md) | The two modes, the nftables chains, what you control, troubleshooting |
 | [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) | What is defended, what is not, and the known holes |
 | [SECURITY.md](SECURITY.md) | How to report something exploitable |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Tests, extension points, code style |
