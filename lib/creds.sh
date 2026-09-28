@@ -35,6 +35,18 @@ CRED_SRC="$HOME/.claude/.credentials.json"
 
 creds_available() { [[ -r $CRED_SRC ]]; }
 
+# Minutes of life left in a credentials file, or "?" if it cannot be read.
+creds_ttl_minutes() {
+  python3 - "${1:-$CRED_SRC}" 2>/dev/null <<'PY' || echo "?"
+import json, sys, time
+try:
+    d = json.load(open(sys.argv[1]))["claudeAiOauth"]
+    print(int((d["expiresAt"] / 1000 - time.time()) / 60))
+except Exception:
+    print("?")
+PY
+}
+
 creds_warn_once() {
   # Shown at create time, once per box, so the choice is informed.
   local mode=$1
@@ -87,7 +99,28 @@ creds_push() {
       && ok "pushed $extra" || warn "failed to push $extra"
   done
 
-  ok "credentials pushed to '$name'"
+  local ttl; ttl=$(creds_ttl_minutes)
+  if [[ $ttl == "?" ]]; then
+    ok "credentials pushed to '$name'"
+  elif (( ttl < 0 )); then
+    warn "pushed, but the token expired $(( -ttl )) minutes ago"
+    creds_rotation_note
+  elif (( ttl < 60 )); then
+    warn "pushed, but this token expires in $ttl minutes"
+    creds_rotation_note
+  else
+    ok "credentials pushed to '$name' (valid for ~$(( ttl / 60 ))h)"
+  fi
+}
+
+# Explains the failure mode people actually hit, at the moment they hit it.
+creds_rotation_note() {
+  dim "    OAuth refresh tokens rotate when they are used. Once this host's own"
+  dim "    Claude refreshes, the copy in the box is stale and cannot renew -- the"
+  dim "    box then asks you to log in. Two fixes:"
+  dim "      short term   agentbox creds <box> push     (re-copy the current token)"
+  dim "      durable      run 'claude setup-token' on the host for a long-lived"
+  dim "                   token, or set ANTHROPIC_API_KEY inside the box"
 }
 
 creds_clear() {
@@ -108,6 +141,17 @@ creds_status() {
       echo "claude oauth token: present ($(stat -c %s ~/.claude/.credentials.json) bytes, mode $(stat -c %a ~/.claude/.credentials.json))"
     else
       echo "claude oauth token: absent"
+    fi
+    if [ -f ~/.claude/.credentials.json ]; then
+      python3 -c "
+import json, time
+try:
+    d = json.load(open(\"/home/agent/.claude/.credentials.json\"))[\"claudeAiOauth\"]
+    m = int((d[\"expiresAt\"]/1000 - time.time())/60)
+    print(\"token validity:     \" + (f\"expired {-m} min ago -- run: agentbox creds <box> push\" if m < 0 else f\"{m} min remaining\"))
+except Exception as e:
+    print(\"token validity:     unreadable\")
+" 2>/dev/null || true
     fi
     printf "git identity:       %s <%s>\n" "$(git config --global user.name 2>/dev/null || echo unset)" \
                                            "$(git config --global user.email 2>/dev/null || echo unset)"

@@ -69,6 +69,13 @@ sudo usermod -aG kvm "$USER"     # log out and back in
 ./bin/agentbox code myproj                       # VS Code, remote, on the workspace
 ```
 
+> [!NOTE]
+> VS Code Remote-SSH downloads its server **on your machine** and copies it over
+> SSH. If your host has restricted or slow connectivity to Microsoft's CDN, the
+> connection hangs at `Downloading VS Code server locally...` even though the box
+> itself can reach it. Set `"remote.SSH.localServerDownload": "off"` to make the
+> box fetch its own copy.
+
 Put `bin/` on your `PATH` (or symlink `bin/agentbox` into `~/.local/bin`) and
 drop the `./bin/` prefix from here on.
 
@@ -175,11 +182,30 @@ box's SSH channel after boot, never through the cloud-init seed, which is an
 unencrypted file on disk.
 
 ```sh
-agentbox creds myproj status      # what this box holds
+agentbox creds myproj status      # what this box holds, and how long it is valid
+agentbox creds myproj push        # re-copy the current token
 agentbox creds myproj clear       # revoke from one box
-agentbox creds myproj push --also ~/.config/gh/hosts.yml
 agentbox create myproj --creds none   # stricter: log in inside the box
 ```
+
+### Why a box eventually asks you to log in
+
+OAuth refresh tokens **rotate when they are used**. Once the Claude on your host
+refreshes its token, the copy inside the box is stale: its access token expires
+and it cannot renew, so it prompts for login. This is inherent to two clients
+sharing one OAuth credential, not something agentbox can paper over.
+
+`agentbox creds <box> push` fixes it for another few hours, and `agentbox up`
+does it automatically. For a box you keep running, the durable answer is a
+credential that is not shared with your interactive session:
+
+```sh
+claude setup-token                              # a long-lived token, on the host
+agentbox ssh myproj -- 'echo export ANTHROPIC_API_KEY=... >> ~/.bashrc'
+```
+
+`agentbox creds <box> status` shows the remaining validity, so you can tell this
+apart from an actual authentication problem.
 
 Set `AGENTBOX_CREDS=none` in `~/.agentbox/agentbox.conf` to make the strict mode
 your default. For GitHub, prefer a deploy key or a fine-grained PAT scoped to the
