@@ -123,5 +123,6 @@ on the bridge.
   `--net slirp` avoids the sudo entirely at the cost of the egress policy.
 - **No snapshot/restore, no fan-out.** One box per project, booted by hand.
   See "Why not Firecracker" for when this stops being enough.
-- **Credentials are per box and are not managed for you.** `agentbox` never
-  copies host credentials into a guest. See README → Credentials.
+- **Credentials are per box and are not managed for you.** `agentbox` copies
+  nothing into a guest by default; `--creds share` opts in. See README →
+  Credentials.

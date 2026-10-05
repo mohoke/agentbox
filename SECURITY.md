@@ -13,8 +13,9 @@ like answered.
 
 The two limits that catch people out:
 
-- **A box holds your credentials by default.** Isolation bounds what an agent can
-  reach, not what it can do with a token you gave it.
+- **A box you gave credentials can act as you.** Isolation bounds what an agent
+  can reach, not what it can do with a token you deliberately handed it. The
+  default (`--creds none`) copies nothing in.
 - **Code the agent writes runs outside the VM**, on your host, with your
   privileges, the moment you execute it. Review diffs.
 

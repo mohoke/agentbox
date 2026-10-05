@@ -8,10 +8,10 @@
 #   *reach*; it does not limit what the agent can *do with that token*, and a
 #   successful prompt injection inside the box can use it.
 #
-#   The default is to share anyway, because the alternative -- logging in again
-#   per box -- is friction that pushes people back to running agents with no
-#   isolation at all, which is strictly worse. A warning you can act on beats a
-#   control you route around.
+#   The default is none: a new box is given nothing and starts logged out, so
+#   there is no token to leak. Sharing is opt-in per box with `--creds share`
+#   (or AGENTBOX_CREDS=share), for when logging in per box is friction that
+#   would push you back to running agents with no isolation at all.
 #
 # What is copied is kept to the minimum that keeps you logged in:
 #
@@ -55,8 +55,8 @@ creds_warn_once() {
       warn "this box will receive a copy of your Claude OAuth token"
       dim  "    An agent in this box can use your account. Isolation limits what it"
       dim  "    can reach, not what it can do with credentials you hand it."
-      dim  "    Stricter options:  --creds none   (log in per box)"
-      dim  "                       agentbox creds <box> clear   (revoke from a box)" ;;
+      dim  "    To avoid this, omit --creds (the default is none), or later:"
+      dim  "    agentbox creds <box> clear   (revoke from a box)" ;;
     none)
       dim  "no host credentials will be copied; run 'claude' inside the box to log in" ;;
   esac

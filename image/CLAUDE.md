@@ -31,11 +31,12 @@ If a result matters, it belongs in `~/workspace`.
   `rg` (ripgrep), `fd`, `sqlite3`, `curl`, `tmux`, `htop`.
 - `sudo` without a password. Use it when a package is genuinely needed.
 
-## This box holds real credentials
+## Credentials in this box
 
-Unless the operator created it with `--creds none`, this VM has a copy of the
-user's actual Claude OAuth token at `~/.claude/.credentials.json`, and is
-configured with their real git identity. Two things follow:
+A box is created with `--creds none` by default, which copies no host credential
+in; if this VM was created with `--creds share`, it has a copy of the user's
+actual Claude OAuth token at `~/.claude/.credentials.json`, and is configured
+with their real git identity. If that credential is present, two things follow:
 
 - **Treat it as live.** Do not print it, copy it into `~/workspace`, paste it
   into a file you might commit, or send it anywhere. It is not a test credential.

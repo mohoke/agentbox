@@ -163,16 +163,23 @@ that, use `--egress none` and hand the box what it needs through `~/workspace`.
 
 ## Credentials
 
-**By default (`--creds share`) each box receives a copy of your host Claude OAuth
-token**, so agents are logged in the moment the box boots. This is a deliberate
-trade-off: requiring a separate login per box is friction that pushes people back
-to running agents with no isolation at all, which is strictly worse than running
-them isolated with a shared token.
+**By default (`--creds none`) a box receives no credentials**, so it starts
+logged out and an agent in it has no token to act with. Log in inside the box, or
+push a token in deliberately:
 
-Be clear about what it costs. A box holding your token can act as you. Isolation
-bounds what an agent can *reach*; it does nothing about what it can *do with a
-credential you handed it*, and a successful prompt injection inside the box can
-use it.
+```sh
+agentbox creds myproj status      # what this box holds, and how long it is valid
+agentbox creds myproj push        # copy the current host token in
+agentbox creds myproj clear       # revoke from one box
+agentbox create myproj --creds share   # opt in to logged-in-on-boot
+```
+
+If the friction of logging in per box is not worth it, `--creds share` copies
+your host Claude OAuth token into the box so agents are logged in the moment it
+boots. Be clear about what it costs. A box holding your token can act as you.
+Isolation bounds what an agent can *reach*; it does nothing about what it can *do
+with a credential you handed it*, and a successful prompt injection inside the
+box can use it.
 
 What is copied is kept to the minimum that keeps you logged in — the token itself
 and your git identity. `~/.claude.json` is deliberately **not** copied: it is tens
@@ -181,23 +188,17 @@ work on, and none of it is needed to stay authenticated. Transfer happens over t
 box's SSH channel after boot, never through the cloud-init seed, which is an
 unencrypted file on disk.
 
-```sh
-agentbox creds myproj status      # what this box holds, and how long it is valid
-agentbox creds myproj push        # re-copy the current token
-agentbox creds myproj clear       # revoke from one box
-agentbox create myproj --creds none   # stricter: log in inside the box
-```
+### Why a shared box eventually asks you to log in
 
-### Why a box eventually asks you to log in
-
-OAuth refresh tokens **rotate when they are used**. Once the Claude on your host
-refreshes its token, the copy inside the box is stale: its access token expires
-and it cannot renew, so it prompts for login. This is inherent to two clients
-sharing one OAuth credential, not something agentbox can paper over.
+This only applies to boxes created with `--creds share`. OAuth refresh tokens
+**rotate when they are used**. Once the Claude on your host refreshes its token,
+the copy inside the box is stale: its access token expires and it cannot renew,
+so it prompts for login. This is inherent to two clients sharing one OAuth
+credential, not something agentbox can paper over.
 
 `agentbox creds <box> push` fixes it for another few hours, and `agentbox up`
-does it automatically. For a box you keep running, the durable answer is a
-credential that is not shared with your interactive session:
+re-pushes the current token automatically. For a box you keep running, the durable
+answer is a credential that is not shared with your interactive session:
 
 ```sh
 claude setup-token                              # a long-lived token, on the host
@@ -207,7 +208,7 @@ agentbox ssh myproj -- 'echo export ANTHROPIC_API_KEY=... >> ~/.bashrc'
 `agentbox creds <box> status` shows the remaining validity, so you can tell this
 apart from an actual authentication problem.
 
-Set `AGENTBOX_CREDS=none` in `~/.agentbox/agentbox.conf` to make the strict mode
+Set `AGENTBOX_CREDS=share` in `~/.agentbox/agentbox.conf` to make token-sharing
 your default. For GitHub, prefer a deploy key or a fine-grained PAT scoped to the
 one repository over your personal token.
 

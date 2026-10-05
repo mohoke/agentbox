@@ -86,15 +86,17 @@ This section is the important one. Read it before trusting the tool.
 
 ### 5.1 Credentials you give the box
 
-**This is the biggest limitation and it is unavoidable by design.** By default
-(`--creds share`) each box receives a copy of your Claude OAuth token. A prompt
-injection inside the box can use that token to do anything your account can do.
-Isolation bounds what the agent can *reach*; it does nothing about what it can
-*do with a credential you handed it*.
+**This is the biggest limitation and it is unavoidable by design whenever you
+hand a credential to a box.** By default (`--creds none`) a box receives no
+credentials and starts logged out, so there is no token to abuse. If you opt in
+with `--creds share`, each box receives a copy of your Claude OAuth token, and a
+prompt injection inside the box can use that token to do anything your account
+can do. Isolation bounds what the agent can *reach*; it does nothing about what
+it can *do with a credential you handed it*.
 
-The default is convenience-first on purpose: requiring a fresh login per box is
-friction that pushes people back to running agents with no isolation at all,
-which is worse. `--creds none` exists and is the stricter choice.
+Sharing is opt-in precisely because of this cost: requiring a fresh login per box
+is friction, but a credential never given cannot be stolen. `--creds none` is the
+default and the stricter choice.
 
 A credential-injecting egress proxy — where the proxy holds the secret and adds
 it to outbound requests, so the guest never sees it — would remove this and is

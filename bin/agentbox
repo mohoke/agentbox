@@ -4,7 +4,9 @@
 
 set -euo pipefail
 
-AGENTBOX_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# Resolve symlinks so the CLI can be deployed outside the repo (e.g. a symlink
+# in ~/.local/bin) without AGENTBOX_ROOT pointing at the link's directory.
+AGENTBOX_ROOT=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
 export AGENTBOX_ROOT
 # shellcheck source=../lib/common.sh
 source "$AGENTBOX_ROOT/lib/common.sh"
@@ -436,7 +438,7 @@ cmd_up() {
 
   log "waiting for ssh"
   if wait_for_ssh "$bd" 240; then
-    if [[ ${BOX_CREDS-share} == share ]]; then
+    if [[ ${BOX_CREDS-none} == share ]]; then
       creds_push "$BOX_NAME" >/dev/null 2>&1 \
         && dim "  creds      host Claude token copied in (agentbox creds $BOX_NAME clear to remove)" \
         || warn "credential push failed; run 'claude' inside the box to log in"
@@ -844,9 +846,10 @@ agentbox -- one disposable KVM microVM per project, for coding agents.
                                  tunnel) with a fail-closed kill switch
       --port HOST:GUEST          publish a guest port (slirp mode)
       --allow BUNDLE             add an egress bundle (agentbox allow --list)
-      --creds share|none         share: copy the host Claude token in (default,
-                                 convenient, and the box can then act as you).
-                                 none: log in separately inside the box.
+      --creds none|share         none (default): copy no credential in; log in
+                                 inside the box. share: copy the host Claude
+                                 token in, which is convenient and lets the box
+                                 act as you.
   up <name>                      boot it
   down <name>                    shut it down
   reset <name>                   wipe the VM disk, keep the workspace
