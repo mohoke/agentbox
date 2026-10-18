@@ -40,8 +40,11 @@ cmd_doctor() {
   chk "ssh client" "$(command -v ssh >/dev/null && echo 1 || echo 0)" "sudo apt install openssh-client"
   chk "jq" "$(command -v jq >/dev/null && echo 1 || echo 0)" "sudo apt install jq"
 
-  # Bridge mode only; slirp boxes work without any of this.
-  if command -v nft >/dev/null && command -v dnsmasq >/dev/null; then
+  # Bridge mode only; slirp boxes work without any of this. Both live in
+  # /usr/sbin, which Debian leaves off a normal user's PATH; we only ever run
+  # them through sudo (whose secure_path has sbin), so look there too.
+  local sbin_path="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+  if PATH=$sbin_path command -v nft >/dev/null && PATH=$sbin_path command -v dnsmasq >/dev/null; then
     ok "nft + dnsmasq (bridge mode available)"
   else
     warn "nft or dnsmasq missing -- only --net slirp will work"

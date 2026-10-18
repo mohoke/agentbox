@@ -1,0 +1,3 @@
+#!/bin/sh
+# no-op xdg-open stub for headless VMs (no desktop environment)
+exit 0
